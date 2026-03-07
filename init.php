@@ -27,8 +27,8 @@ class Af_Feed_Advisor extends Plugin
     function about()
     {
         return array(
-            1.0,
-            'Analyzes feeds and provides configuration recommendations',
+            2.2,
+            'Analyzes feeds, monitors system health, and provides recommendations',
             'Feed Advisor'
         );
     }
@@ -40,6 +40,7 @@ class Af_Feed_Advisor extends Plugin
         // Register hooks
         $host->add_hook($host::HOOK_ARTICLE_FILTER, $this);
         $host->add_hook($host::HOOK_PREFS_TAB, $this);
+        $host->add_hook($host::HOOK_HOUSE_KEEPING, $this);
     }
 
     function get_generated_feeds($feed_id = null)
@@ -71,6 +72,16 @@ class Af_Feed_Advisor extends Plugin
         }
 
         return $article;
+    }
+
+    /**
+     * Hook called during housekeeping (periodic tasks)
+     */
+    function hook_house_keeping()
+    {
+        if ($this->is_enabled() && $this->should_check_logs()) {
+            $this->check_system_logs();
+        }
     }
 
     /**
@@ -280,6 +291,13 @@ class Af_Feed_Advisor extends Plugin
 
         $content .= "<p><strong>Reason:</strong> {$analysis['reason']}</p>";
 
+        $content .= "<h2>Change This Setting</h2>";
+        $content .= "<p>";
+        $content .= "<a href=\"javascript:CommonDialogs.editFeed({$analysis['feed_id']})\">Open feed settings for &quot;{$analysis['feed_title']}&quot;</a>";
+        $content .= " then go to the <strong>Display</strong> tab and toggle <em>Always display image attachments</em>.";
+        $content .= "</p>";
+        $content .= "<p><small>(Link opens the feed edit dialog in TT-RSS web UI. In mobile clients, go to Preferences -&gt; Feeds.)</small></p>";
+
         $content .= "<h2>SQL to apply this change</h2>";
         $content .= "<pre>UPDATE ttrss_feeds SET always_display_enclosures = {$setting_recommended} WHERE id = {$analysis['feed_id']};</pre>";
 
@@ -294,20 +312,21 @@ class Af_Feed_Advisor extends Plugin
 
         // Insert into ttrss_entries
         $guid = "feed-advisor:" . $analysis['feed_id'] . ":" . $analysis['issue_type'] . ":" . time();
-        $link = "about:feed-advisor#" . $analysis['feed_id'];
+        $link = "javascript:CommonDialogs.editFeed(" . $analysis['feed_id'] . ")";
+        $content_hash = 'SHA1:' . sha1($content);
 
         $sth = $pdo->prepare('
-            INSERT INTO ttrss_entries (title, guid, link, content, date_entered, date_updated)
-            VALUES (?, ?, ?, ?, NOW(), NOW())
+            INSERT INTO ttrss_entries (title, guid, link, content, content_hash, updated, date_entered, date_updated)
+            VALUES (?, ?, ?, ?, ?, NOW(), NOW(), NOW())
             RETURNING id
         ');
-        $sth->execute([$title, $guid, $link, $content]);
+        $sth->execute([$title, $guid, $link, $content, $content_hash]);
         $entry_id = $sth->fetch(PDO::FETCH_COLUMN);
 
-        // Link to the owner's user entries (assuming owner_uid = 1, adjust if needed)
+        // Link to the owner's user entries
         $sth = $pdo->prepare('
-            INSERT INTO ttrss_user_entries (ref_id, feed_id, owner_uid, unread, marked, published, last_marked, last_published)
-            SELECT ?, id, owner_id, true, false, false, NULL, NULL
+            INSERT INTO ttrss_user_entries (ref_id, feed_id, owner_uid, unread, marked, published, uuid, tag_cache, label_cache)
+            SELECT ?, id, owner_uid, true, false, false, \'\', \'\', \'{"no-labels":1}\'
             FROM ttrss_feeds
             WHERE id = ?
             LIMIT 1
@@ -631,6 +650,262 @@ class Af_Feed_Advisor extends Plugin
     }
 
     /**
+     * Check if we should run log monitoring (twice daily: 6am and 6pm)
+     */
+    private function should_check_logs()
+    {
+        $state = $this->get_state();
+        $last_check = $state['last_log_check'] ?? 0;
+        $current_hour = (int)date('H');
+
+        // Run at 6am and 6pm (within a 1-hour window to account for housekeeping timing)
+        $is_morning_window = ($current_hour >= 6 && $current_hour < 7);
+        $is_evening_window = ($current_hour >= 18 && $current_hour < 19);
+
+        if (!$is_morning_window && !$is_evening_window) {
+            return false;
+        }
+
+        // Don't run if we checked in the last 6 hours
+        $hours_since_check = (time() - $last_check) / 3600;
+        return $hours_since_check >= 6;
+    }
+
+    /**
+     * Check system logs for errors and warnings
+     */
+    private function check_system_logs()
+    {
+        // Parse Docker logs from the last 12 hours
+        $issues = $this->parse_docker_logs();
+
+        if (empty($issues)) {
+            // No issues found, update state and return
+            $state = $this->get_state();
+            $state['last_log_check'] = time();
+            $this->set_state($state);
+            return;
+        }
+
+        // Create consolidated advisory
+        $this->create_system_advisory($issues);
+
+        // Update state
+        $state = $this->get_state();
+        $state['last_log_check'] = time();
+        $this->set_state($state);
+    }
+
+    /**
+     * Parse Docker logs for warnings, errors, and exceptions
+     */
+    private function parse_docker_logs()
+    {
+        $issues = array(
+            'errors' => array(),
+            'warnings' => array(),
+            'exceptions' => array()
+        );
+
+        try {
+            // Check if log file is mounted (optional feature)
+            // To enable: docker run -v /var/run/docker.sock:/var/run/docker.sock
+            // Or mount a log file at /var/log/ttrss/docker.log
+            $log_file = '/var/log/ttrss/docker.log';
+
+            if (!file_exists($log_file)) {
+                Debug::log("Feed Advisor: Log file not found at {$log_file} - skipping system monitoring");
+                return $issues;
+            }
+
+            // Read last 12 hours of logs from file
+            $twelve_hours_ago = time() - (12 * 3600);
+            $output = array();
+
+            $handle = fopen($log_file, 'r');
+            if (!$handle) {
+                return $issues;
+            }
+
+            while (($line = fgets($handle)) !== false) {
+                $output[] = $line;
+            }
+            fclose($handle);
+
+            if (empty($output)) {
+                return $issues;
+            }
+
+            $error_counts = array();
+            $warning_counts = array();
+            $exception_counts = array();
+
+            foreach ($output as $line) {
+                // Skip empty lines
+                if (trim($line) === '') {
+                    continue;
+                }
+
+                // Match exceptions
+                if (preg_match('/Exception: (.+)/', $line, $matches)) {
+                    $error_msg = trim($matches[1]);
+                    if (!isset($exception_counts[$error_msg])) {
+                        $exception_counts[$error_msg] = 0;
+                    }
+                    $exception_counts[$error_msg]++;
+                }
+                // Match errors (case insensitive)
+                elseif (preg_match('/\b(ERROR|SQLSTATE)\b/i', $line)) {
+                    // Extract meaningful error message
+                    $error_msg = $this->extract_error_message($line);
+                    if ($error_msg && !isset($error_counts[$error_msg])) {
+                        $error_counts[$error_msg] = 0;
+                    }
+                    if ($error_msg) {
+                        $error_counts[$error_msg]++;
+                    }
+                }
+                // Match warnings
+                elseif (preg_match('/\b(WARNING|Warning|warning)\b/', $line)) {
+                    $warning_msg = $this->extract_error_message($line);
+                    if ($warning_msg && !isset($warning_counts[$warning_msg])) {
+                        $warning_counts[$warning_msg] = 0;
+                    }
+                    if ($warning_msg) {
+                        $warning_counts[$warning_msg]++;
+                    }
+                }
+            }
+
+            // Convert counts to issue arrays
+            foreach ($exception_counts as $msg => $count) {
+                $issues['exceptions'][] = array('message' => $msg, 'count' => $count);
+            }
+            foreach ($error_counts as $msg => $count) {
+                $issues['errors'][] = array('message' => $msg, 'count' => $count);
+            }
+            foreach ($warning_counts as $msg => $count) {
+                $issues['warnings'][] = array('message' => $msg, 'count' => $count);
+            }
+
+            // Sort by count (descending)
+            usort($issues['exceptions'], function($a, $b) { return $b['count'] - $a['count']; });
+            usort($issues['errors'], function($a, $b) { return $b['count'] - $a['count']; });
+            usort($issues['warnings'], function($a, $b) { return $b['count'] - $a['count']; });
+
+        } catch (Exception $e) {
+            // Log parsing failed, return empty
+            Debug::log("Feed Advisor: Failed to parse Docker logs: " . $e->getMessage());
+        }
+
+        return $issues;
+    }
+
+    /**
+     * Extract meaningful error message from log line
+     */
+    private function extract_error_message($line)
+    {
+        // Remove timestamp and container prefix
+        $line = preg_replace('/^[^|]*\|\s*/', '', $line);
+        $line = preg_replace('/^\[\d+:\d+:\d+\/\d+\]\s*/', '', $line);
+
+        // Extract just the error message (first 200 chars)
+        $line = trim($line);
+        if (strlen($line) > 200) {
+            $line = substr($line, 0, 200) . '...';
+        }
+
+        return $line;
+    }
+
+    /**
+     * Create a consolidated system advisory article
+     */
+    private function create_system_advisory($issues)
+    {
+        $pdo = Db::pdo();
+        $timestamp = date('Y-m-d H:i:s');
+
+        // Build advisory content
+        $content = "<div class='feed-advisor-article'>";
+        $content .= "<h2>System Health Report</h2>";
+        $content .= "<p><strong>Generated:</strong> {$timestamp}</p>";
+        $content .= "<p>This report summarizes errors, warnings, and exceptions from the last 12 hours.</p>";
+
+        $total_issues = count($issues['exceptions']) + count($issues['errors']) + count($issues['warnings']);
+
+        if ($total_issues === 0) {
+            $content .= "<p><strong>✓ No issues detected</strong></p>";
+        } else {
+            // Exceptions section
+            if (!empty($issues['exceptions'])) {
+                $content .= "<h3>Exceptions (" . count($issues['exceptions']) . ")</h3>";
+                $content .= "<ul>";
+                foreach ($issues['exceptions'] as $issue) {
+                    $count_text = $issue['count'] > 1 ? " ({$issue['count']} occurrences)" : "";
+                    $content .= "<li><code>" . htmlspecialchars($issue['message']) . "</code>{$count_text}</li>";
+                }
+                $content .= "</ul>";
+            }
+
+            // Errors section
+            if (!empty($issues['errors'])) {
+                $content .= "<h3>Errors (" . count($issues['errors']) . ")</h3>";
+                $content .= "<ul>";
+                foreach ($issues['errors'] as $issue) {
+                    $count_text = $issue['count'] > 1 ? " ({$issue['count']} occurrences)" : "";
+                    $content .= "<li><code>" . htmlspecialchars($issue['message']) . "</code>{$count_text}</li>";
+                }
+                $content .= "</ul>";
+            }
+
+            // Warnings section
+            if (!empty($issues['warnings'])) {
+                $content .= "<h3>Warnings (" . count($issues['warnings']) . ")</h3>";
+                $content .= "<ul>";
+                foreach ($issues['warnings'] as $issue) {
+                    $count_text = $issue['count'] > 1 ? " ({$issue['count']} occurrences)" : "";
+                    $content .= "<li><code>" . htmlspecialchars($issue['message']) . "</code>{$count_text}</li>";
+                }
+                $content .= "</ul>";
+            }
+        }
+
+        $content .= "<hr>";
+        $content .= "<p><small>Monitoring period: Last 12 hours<br>";
+        $content .= "Total issues: {$total_issues}</small></p>";
+        $content .= "</div>";
+
+        // Create the advisory article
+        $title = "System Health Report - {$timestamp}";
+        $guid = "feed-advisor:system-health:" . time();
+        $link = "about:feed-advisor#system-health";
+        $content_hash = 'SHA1:' . sha1($content);
+
+        try {
+            $sth = $pdo->prepare('
+                INSERT INTO ttrss_entries (title, guid, link, content, content_hash, updated, date_entered, date_updated)
+                VALUES (?, ?, ?, ?, ?, NOW(), NOW(), NOW())
+                RETURNING id
+            ');
+            $sth->execute([$title, $guid, $link, $content, $content_hash]);
+            $entry_id = $sth->fetch(PDO::FETCH_COLUMN);
+
+            // Link to user entries (owner_uid = 1)
+            $sth = $pdo->prepare('
+                INSERT INTO ttrss_user_entries (ref_id, feed_id, owner_uid, unread, marked, published, uuid, tag_cache, label_cache)
+                VALUES (?, NULL, 1, true, false, false, \'\', \'\', \'{"no-labels":1}\')
+            ');
+            $sth->execute([$entry_id]);
+
+            Debug::log("Feed Advisor: Created system health advisory with {$total_issues} issues");
+        } catch (Exception $e) {
+            Debug::log("Feed Advisor: Failed to create system advisory: " . $e->getMessage());
+        }
+    }
+
+    /**
      * Preferences tab
      */
     function hook_prefs_tab($args)
@@ -639,7 +914,7 @@ class Af_Feed_Advisor extends Plugin
             return;
         }
 
-        print "<div dojoType='dijit.layout.AccordionPane' title='Feed Advisor'>";
+        print "<div dojoType='dijit.layout.AccordionPane' title=\"<i class='material-icons'>recommend</i> Feed Advisor\">";
 
         print "<h2>Feed Advisor Settings</h2>";
 
@@ -681,6 +956,19 @@ class Af_Feed_Advisor extends Plugin
             __("Save") . "</button>";
 
         print "</form>";
+
+        // System monitoring info
+        $state = $this->get_state();
+        $last_check = $state['last_log_check'] ?? 0;
+        $last_check_str = $last_check ? date('Y-m-d H:i:s', $last_check) : 'Never';
+
+        print "<h3>System Health Monitoring</h3>";
+        print "<p>Feed Advisor automatically monitors TT-RSS logs for errors, warnings, and exceptions.</p>";
+        print "<ul>";
+        print "<li><strong>Schedule:</strong> Twice daily (6am and 6pm)</li>";
+        print "<li><strong>Last check:</strong> {$last_check_str}</li>";
+        print "<li><strong>Monitoring:</strong> Last 12 hours of Docker logs</li>";
+        print "</ul>";
 
         // Bulk operations
         print "<h2>Bulk Operations</h2>";
@@ -726,7 +1014,9 @@ class Af_Feed_Advisor extends Plugin
             print "</table>";
         }
 
-        // Add JavaScript for AJAX handlers
+        print "</div>";
+
+        // JavaScript must be outside the accordion pane div so Dojo executes it
         print "<script type='text/javascript'>";
         print "if (!Plugins.Af_Feed_Advisor) Plugins.Af_Feed_Advisor = {};";
 
@@ -804,8 +1094,6 @@ class Af_Feed_Advisor extends Plugin
         };";
 
         print "</script>";
-
-        print "</div>";
     }
 
     /**
