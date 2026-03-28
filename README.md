@@ -9,6 +9,7 @@ The Feed Advisor plugin automatically analyzes your RSS feeds and generates advi
 - **Enclosure Detection**: Identifies feeds that provide images as enclosures (media:content) and recommends enabling `always_display_enclosures`
 - **Duplicate Prevention**: Detects feeds with both inline images and enclosures, recommending disabling enclosure display to prevent duplicates
 - **Advisory Feed**: Creates a special "System Advisories" feed where recommendations appear as articles
+- **System Health Monitoring**: Reads Docker logs twice daily and creates advisory articles summarizing errors, warnings, and exceptions
 - **Non-destructive**: Never changes settings automatically - provides SQL commands you can run manually
 - **Smart Analysis**: Only analyzes feeds when needed, avoiding duplicate advisories
 
@@ -61,7 +62,103 @@ Go to Preferences → Feeds → Feed Advisor to configure:
    - Explanation of why the change is recommended
    - SQL command to apply the change
 
+## System Health Monitoring
+
+The plugin includes system health monitoring that creates advisory articles twice
+daily (6am and 6pm) summarizing any errors, warnings, or exceptions from TT-RSS logs.
+
+### How It Works
+
+1. **Cron job runs twice daily** (5:55am and 5:55pm) and exports the last 12 hours
+   of Docker logs to `/tmp/ttrss-logs/docker.log`
+2. **Docker mounts the log file** into the containers at `/var/log/ttrss/docker.log`
+   (read-only)
+3. **Plugin checks logs** during housekeeping (around 6am and 6pm) by reading the
+   mounted log file
+4. **Advisory article created** if any errors, warnings, or exceptions are found,
+   containing:
+   - List of unique exceptions with occurrence counts
+   - List of unique errors with occurrence counts
+   - List of unique warnings with occurrence counts
+   - Total count of issues
+
+### Setup
+
+#### Step 1: Create Log Directory
+
+```bash
+mkdir -p /tmp/ttrss-logs
+```
+
+#### Step 2: Update docker-compose.yaml
+
+Add the log file mount to both the `app` and `updater` services:
+
+```yaml
+services:
+  app:
+    volumes:
+      - /tmp/ttrss-logs/docker.log:/var/log/ttrss/docker.log:ro
+      # ... other volumes
+
+  updater:
+    volumes:
+      - /tmp/ttrss-logs/docker.log:/var/log/ttrss/docker.log:ro
+      # ... other volumes
+```
+
+#### Step 3: Set Up Cron Job
+
+Add to your crontab (`crontab -e`):
+
+```cron
+# Export TT-RSS Docker logs twice daily at 5:55am and 5:55pm
+# (5 minutes before the plugin checks at 6am and 6pm)
+55 5,17 * * * /home/jayemar/projects/homelab/ttrss/scripts/export-docker-logs.sh
+```
+
+#### Step 4: Restart Services
+
+```bash
+cd /home/jayemar/projects/homelab/ttrss
+docker compose down
+docker compose up -d
+```
+
+#### Step 5: Test the Setup
+
+Run the export script manually to verify it works:
+
+```bash
+/home/jayemar/projects/homelab/ttrss/scripts/export-docker-logs.sh
+```
+
+Check that the log file was created:
+
+```bash
+ls -lh /tmp/ttrss-logs/docker.log
+```
+
+### Monitoring Schedule
+
+- **Checks:** Twice daily at 6am and 6pm (within 1-hour window)
+- **Coverage:** Last 12 hours of logs
+- **Frequency:** Won't run more than once per 6-hour period
+
+### Disabling System Monitoring
+
+To disable system health monitoring while keeping feed enclosure analysis:
+
+1. Remove the log file mount from `docker-compose.yaml`
+2. Remove or comment out the cron job
+3. Restart services
+
+The plugin automatically skips system monitoring if the log file is not available,
+but continues to analyze feeds for enclosure configuration issues.
+
 ## Advisory Format
+
+### Feed Analysis Advisories
 
 ```
 Title: Crowd Supply: Enable enclosure display
@@ -88,6 +185,19 @@ UPDATE ttrss_feeds SET always_display_enclosures = true WHERE id = 358;
 Articles analyzed: 20 most recent
 Last checked: 2026-01-27 14:30:45
 ```
+
+### System Health Advisories
+
+System health advisories appear as regular articles in your TT-RSS feed with titles like:
+
+- "System Health Report - 2026-02-05 06:00:00"
+
+They include:
+
+- Timestamp of when the report was generated
+- Categorized list of exceptions, errors, and warnings
+- Occurrence counts for each issue
+- Total issue count
 
 ## Use Cases
 
@@ -173,6 +283,35 @@ Planned features for future versions:
 Plugin state is stored in `ttrss_plugin_storage`:
 ```sql
 DELETE FROM ttrss_plugin_storage WHERE name = 'Af_Feed_Advisor';
+```
+
+### No health advisory articles appearing
+
+1. Check that the log file exists and is readable:
+   ```bash
+   docker compose exec app ls -l /var/log/ttrss/docker.log
+   ```
+
+2. Check that the cron job is running:
+   ```bash
+   crontab -l
+   ```
+
+3. Check the export script output:
+   ```bash
+   /home/jayemar/projects/homelab/ttrss/scripts/export-docker-logs.sh
+   ```
+
+4. Check plugin status in TT-RSS Preferences -> Plugins -> Feed Advisor
+
+### Advisory showing "No issues detected" when you know there are errors
+
+The plugin looks for specific patterns: `Exception:`, `ERROR`, `SQLSTATE`,
+`WARNING`, `Warning`, `warning`. Check that your errors match these patterns,
+then inspect the log file content:
+
+```bash
+cat /tmp/ttrss-logs/docker.log | grep -i error
 ```
 
 ## License
