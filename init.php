@@ -24,6 +24,20 @@ class Af_Feed_Advisor extends Plugin
     const CATEGORY_ENABLE_IMAGES = 'enable_images';
     const CATEGORY_ENABLE_MEDIA = 'enable_media';
 
+    // Feed health monitoring
+    const ISSUE_FEED_404 = 'feed_404';
+    const ISSUE_FEED_403 = 'feed_403';
+    const ISSUE_FEED_DNS = 'feed_dns';
+    const ISSUE_FEED_TIMEOUT = 'feed_timeout';
+    const ISSUE_FEED_PARSE = 'feed_parse';
+    const ISSUE_FEED_SERVER = 'feed_server';
+    const ISSUE_FEED_OTHER = 'feed_other';
+
+    const FEED_HEALTH_LABEL = 'feed-health';
+    const FEED_HEALTH_BROKEN_DAYS = 7;
+    const FEED_STALE_DAYS = 365;
+    const REPORT_INTERVAL_HOURS = 12;
+
     function about()
     {
         return array(
@@ -79,8 +93,19 @@ class Af_Feed_Advisor extends Plugin
      */
     function hook_house_keeping()
     {
-        if ($this->is_enabled() && $this->should_check_logs()) {
-            $this->check_system_logs();
+        if ($this->is_enabled()) {
+            if ($this->should_check_logs()) {
+                $this->check_system_logs();
+            }
+            if ($this->should_check_health()) {
+                $sth = Db::pdo()->query("SELECT id FROM ttrss_users WHERE id > 0");
+                foreach ($sth->fetchAll(PDO::FETCH_COLUMN) as $uid) {
+                    $this->check_feed_health((int)$uid);
+                }
+                $state = $this->get_state();
+                $state['last_health_check'] = time();
+                $this->set_state($state);
+            }
         }
     }
 
@@ -292,11 +317,9 @@ class Af_Feed_Advisor extends Plugin
         $content .= "<p><strong>Reason:</strong> {$analysis['reason']}</p>";
 
         $content .= "<h2>Change This Setting</h2>";
-        $content .= "<p>";
-        $content .= "<a href=\"javascript:CommonDialogs.editFeed({$analysis['feed_id']})\">Open feed settings for &quot;{$analysis['feed_title']}&quot;</a>";
-        $content .= " then go to the <strong>Display</strong> tab and toggle <em>Always display image attachments</em>.";
-        $content .= "</p>";
-        $content .= "<p><small>(Link opens the feed edit dialog in TT-RSS web UI. In mobile clients, go to Preferences -&gt; Feeds.)</small></p>";
+        $content .= "<p>In TT-RSS Preferences &rarr; Feeds, open the settings for &quot;" .
+                    htmlspecialchars($analysis['feed_title']) .
+                    "&quot; and go to the <strong>Display</strong> tab and toggle <em>Always display image attachments</em>.</p>";
 
         $content .= "<h2>SQL to apply this change</h2>";
         $content .= "<pre>UPDATE ttrss_feeds SET always_display_enclosures = {$setting_recommended} WHERE id = {$analysis['feed_id']};</pre>";
@@ -312,7 +335,7 @@ class Af_Feed_Advisor extends Plugin
 
         // Insert into ttrss_entries
         $guid = "feed-advisor:" . $analysis['feed_id'] . ":" . $analysis['issue_type'] . ":" . time();
-        $link = "javascript:CommonDialogs.editFeed(" . $analysis['feed_id'] . ")";
+        $link = "about:feed-advisor#advisory-" . $analysis['feed_id'];
         $content_hash = 'SHA1:' . sha1($content);
 
         $sth = $pdo->prepare('
@@ -654,11 +677,8 @@ class Af_Feed_Advisor extends Plugin
      */
     private function should_check_logs()
     {
-        $state = $this->get_state();
-        $last_check = $state['last_log_check'] ?? 0;
         $current_hour = (int)date('H');
 
-        // Run at 6am and 6pm (within a 1-hour window to account for housekeeping timing)
         $is_morning_window = ($current_hour >= 6 && $current_hour < 7);
         $is_evening_window = ($current_hour >= 18 && $current_hour < 19);
 
@@ -666,9 +686,330 @@ class Af_Feed_Advisor extends Plugin
             return false;
         }
 
-        // Don't run if we checked in the last 6 hours
-        $hours_since_check = (time() - $last_check) / 3600;
-        return $hours_since_check >= 6;
+        try {
+            $pdo = Db::pdo();
+            $window = ($current_hour < 12) ? 'morning' : 'evening';
+            $guid = 'feed-advisor:system-health:' . date('Y-m-d') . '-' . $window;
+            $sth = $pdo->prepare("SELECT COUNT(*) FROM ttrss_entries WHERE guid = ?");
+            $sth->execute([$guid]);
+            return (int)$sth->fetchColumn() === 0;
+        } catch (Exception $e) {
+            Debug::log("Feed Advisor: Failed to check for recent health report: " . $e->getMessage());
+            return false;
+        }
+    }
+
+    private function get_plugin_setting(string $key, $default)
+    {
+        // Works in web context where owner_uid is set
+        $val = $this->host->get($this, $key, null);
+        if ($val !== null && $val !== false) {
+            return $val;
+        }
+
+        // In daemon context owner_uid is 0; fall back to admin user (uid=1) stored settings
+        try {
+            $pdo = Db::pdo();
+            $sth = $pdo->prepare(
+                "SELECT content FROM ttrss_plugin_storage WHERE name = 'Af_Feed_Advisor' AND owner_uid = 1"
+            );
+            $sth->execute();
+            $row = $sth->fetch();
+            if ($row) {
+                $data = unserialize($row['content']);
+                if (is_array($data) && isset($data[$key])) {
+                    return $data[$key];
+                }
+            }
+        } catch (Exception $e) {
+            // fall through
+        }
+
+        return $default;
+    }
+
+    private function get_broken_days(): int
+    {
+        return max(1, (int)$this->get_plugin_setting('broken_days', self::FEED_HEALTH_BROKEN_DAYS));
+    }
+
+    private function get_stale_days(): int
+    {
+        return max(30, (int)$this->get_plugin_setting('stale_days', self::FEED_STALE_DAYS));
+    }
+
+    private function get_report_interval_hours(): int
+    {
+        $valid = [1, 6, 12, 24, 168];
+        $v = (int)$this->get_plugin_setting('report_interval_hours', self::REPORT_INTERVAL_HOURS);
+        return in_array($v, $valid) ? $v : self::REPORT_INTERVAL_HOURS;
+    }
+
+    private function should_check_health(?int $now = null): bool
+    {
+        $state = $this->get_state();
+        $last_run = (int)($state['last_health_check'] ?? 0);
+        $interval_seconds = $this->get_report_interval_hours() * 3600;
+        return (($now ?? time()) - $last_run) >= $interval_seconds;
+    }
+
+    private function check_feed_health(int $owner_uid): int
+    {
+        $pdo = Db::pdo();
+        $broken_days = $this->get_broken_days();
+        $stale_days = $this->get_stale_days();
+
+        $sth = $pdo->prepare("
+            SELECT id, title, feed_url, last_error, last_updated,
+                   last_successful_update, owner_uid
+            FROM ttrss_feeds
+            WHERE last_error != ''
+              AND owner_uid = ?
+              AND (last_successful_update IS NULL
+                   OR last_successful_update < NOW() - INTERVAL '{$broken_days} days')
+            ORDER BY last_successful_update NULLS FIRST, title
+        ");
+        $sth->execute([$owner_uid]);
+        $broken_feeds = $sth->fetchAll(PDO::FETCH_ASSOC);
+
+        $sth = $pdo->prepare("
+            SELECT f.id, f.title, f.feed_url, f.owner_uid,
+                   MAX(e.updated) AS last_article_date
+            FROM ttrss_feeds f
+            JOIN ttrss_user_entries ue ON ue.feed_id = f.id
+            JOIN ttrss_entries e ON e.id = ue.ref_id
+            WHERE (f.last_error = '' OR f.last_error IS NULL)
+              AND f.owner_uid = ?
+              AND f.feed_url NOT LIKE 'share-anything:%'
+            GROUP BY f.id, f.title, f.feed_url, f.owner_uid
+            HAVING MAX(e.updated) < NOW() - INTERVAL '{$stale_days} days'
+            ORDER BY MAX(e.updated) ASC
+        ");
+        $sth->execute([$owner_uid]);
+        $stale_feeds = $sth->fetchAll(PDO::FETCH_ASSOC);
+
+        $this->create_consolidated_health_advisory($broken_feeds, $stale_feeds, $owner_uid);
+
+        $broken_count = count($broken_feeds);
+        $stale_count = count($stale_feeds);
+        Debug::log("Feed Advisor: Health check complete for uid={$owner_uid}, {$broken_count} broken, {$stale_count} stale.");
+        return $broken_count + $stale_count;
+    }
+
+    private function create_consolidated_health_advisory(array $broken_feeds, array $stale_feeds, int $owner_uid): void
+    {
+        $pdo = Db::pdo();
+        $timestamp = date('Y-m-d H:i:s');
+        $guid = 'feed-advisor:health-report:' . date('Y-m-d-H-i-s') . '-uid' . $owner_uid;
+        $broken_count = count($broken_feeds);
+        $stale_count = count($stale_feeds);
+        $broken_days = $this->get_broken_days();
+        $stale_days = $this->get_stale_days();
+
+        $parts = [];
+        if ($broken_count > 0) {
+            $parts[] = "{$broken_count} broken";
+        }
+        if ($stale_count > 0) {
+            $parts[] = "{$stale_count} stale";
+        }
+        $title = "Feed Health Report" . (!empty($parts) ? ': ' . implode(', ', $parts) : ': all clear');
+
+        $content = "<div class='feed-advisor-article'>";
+        $content .= "<h2>Feed Health Report</h2>";
+        $content .= "<p><strong>Generated:</strong> {$timestamp}</p>";
+
+        // Broken feeds section
+        $content .= "<h3>Broken Feeds</h3>";
+        if ($broken_count === 0) {
+            $content .= "<p>No feeds have been failing for more than {$broken_days} days.</p>";
+        } else {
+            $content .= "<p>{$broken_count} feed" . ($broken_count !== 1 ? 's have' : ' has') .
+                        " been failing for more than {$broken_days} days.</p>";
+            $content .= "<table>";
+            $content .= "<tr><th>Feed</th><th>Error Type</th><th>Last Success</th><th>Broken For</th><th>Suggestion</th></tr>";
+
+            foreach ($broken_feeds as $feed) {
+                $error_info = $this->categorize_feed_error($feed['last_error']);
+
+                if ($feed['last_successful_update']) {
+                    $last_success = new DateTime($feed['last_successful_update']);
+                    $days_broken = (int)(new DateTime())->diff($last_success)->days;
+                    $last_success_str = $feed['last_successful_update'];
+                } else {
+                    $days_broken = null;
+                    $last_success_str = 'Never';
+                }
+
+                $days_str = ($days_broken !== null) ? "{$days_broken}d" : 'Unknown';
+
+                $feed_link = "<a href=\"" . htmlspecialchars($feed['feed_url']) . "\" target=\"_blank\" rel=\"noopener\">" .
+                             htmlspecialchars($feed['title']) . "</a>";
+                $content .= "<tr>";
+                $content .= "<td>{$feed_link}</td>";
+                $content .= "<td>{$error_info['label']}</td>";
+                $content .= "<td>{$last_success_str}</td>";
+                $content .= "<td>{$days_str}</td>";
+                $content .= "<td>{$error_info['suggestion']}</td>";
+                $content .= "</tr>";
+            }
+
+            $content .= "</table>";
+        }
+
+        // Stale feeds section
+        $content .= "<h3>Stale Feeds</h3>";
+        if ($stale_count === 0) {
+            $content .= "<p>No feeds have gone more than {$stale_days} days without a new article.</p>";
+        } else {
+            $content .= "<p>{$stale_count} feed" . ($stale_count !== 1 ? 's have' : ' has') .
+                        " not published a new article in more than {$stale_days} days.</p>";
+            $content .= "<table>";
+            $content .= "<tr><th>Feed</th><th>Last Article</th><th>Days Silent</th></tr>";
+
+            foreach ($stale_feeds as $feed) {
+                $last_date = $feed['last_article_date'];
+                $last_dt = new DateTime($last_date);
+                $days_silent = (int)(new DateTime())->diff($last_dt)->days;
+
+                $feed_link = "<a href=\"" . htmlspecialchars($feed['feed_url']) . "\" target=\"_blank\" rel=\"noopener\">" .
+                             htmlspecialchars($feed['title']) . "</a>";
+                $content .= "<tr>";
+                $content .= "<td>{$feed_link}</td>";
+                $content .= "<td>{$last_date}</td>";
+                $content .= "<td>{$days_silent}d</td>";
+                $content .= "</tr>";
+            }
+
+            $content .= "</table>";
+        }
+
+        $content .= "<hr>";
+        $content .= "<p><small>Checked: {$timestamp}</small></p>";
+        $content .= "</div>";
+
+        $link = "about:feed-advisor#feed-health";
+        $content_hash = 'SHA1:' . sha1($content);
+
+        try {
+            $sth = $pdo->prepare("
+                INSERT INTO ttrss_entries
+                    (title, guid, link, content, content_hash, updated, date_entered, date_updated)
+                VALUES (?, ?, ?, ?, ?, NOW(), NOW(), NOW())
+                ON CONFLICT (guid) DO NOTHING
+                RETURNING id
+            ");
+            $sth->execute([$title, $guid, $link, $content, $content_hash]);
+            $entry_id = $sth->fetchColumn();
+
+            if (!$entry_id) {
+                Debug::log("Feed Advisor: Health report for this window already exists, skipping.");
+                return;
+            }
+
+            $sth = $pdo->prepare("
+                INSERT INTO ttrss_user_entries
+                    (ref_id, feed_id, owner_uid, unread, marked, published, uuid, tag_cache, label_cache)
+                VALUES (?, NULL, ?, true, false, false, '', '', '')
+                ON CONFLICT DO NOTHING
+            ");
+            $sth->execute([$entry_id, $owner_uid]);
+
+            if ($broken_count > 0 || $stale_count > 0) {
+                $label_id = $this->get_or_create_health_label($owner_uid);
+                if ($label_id) {
+                    $this->apply_label_to_entry($entry_id, $label_id);
+                }
+            }
+
+            Debug::log("Feed Advisor: Created health report ({$broken_count} broken, {$stale_count} stale).");
+        } catch (Exception $e) {
+            Debug::log("Feed Advisor: Failed to create consolidated health report: " . $e->getMessage());
+        }
+    }
+
+    private function categorize_feed_error(string $error): array
+    {
+        if (preg_match('/404|Not Found/i', $error)) {
+            return [
+                'type' => self::ISSUE_FEED_404,
+                'label' => 'Not Found (404)',
+                'suggestion' => 'The feed URL no longer exists. Check whether the site has a new feed URL, or remove this feed.',
+            ];
+        }
+        if (preg_match('/403|Forbidden|Cloudflare/i', $error)) {
+            return [
+                'type' => self::ISSUE_FEED_403,
+                'label' => 'Access Blocked (403)',
+                'suggestion' => 'The server is blocking access, likely due to Cloudflare protection or bot detection. The feed may have moved behind a login or paywall.',
+            ];
+        }
+        if (preg_match('/cURL error 6|Could not resolve host/i', $error)) {
+            return [
+                'type' => self::ISSUE_FEED_DNS,
+                'label' => 'DNS Failure',
+                'suggestion' => 'The domain cannot be resolved. The site may have shut down or moved to a new domain.',
+            ];
+        }
+        if (preg_match('/cURL error 28|timed out|timeout/i', $error)) {
+            return [
+                'type' => self::ISSUE_FEED_TIMEOUT,
+                'label' => 'Connection Timeout',
+                'suggestion' => 'The server is not responding. It may be temporarily down or rate-limiting connections.',
+            ];
+        }
+        if (preg_match('/LibXML|StartTag|invalid element/i', $error)) {
+            return [
+                'type' => self::ISSUE_FEED_PARSE,
+                'label' => 'Parse Error',
+                'suggestion' => 'The feed content cannot be parsed. The URL may now return non-feed content (an HTML page, for example).',
+            ];
+        }
+        if (preg_match('/503|Service Unavailable|500|Server Error/i', $error)) {
+            return [
+                'type' => self::ISSUE_FEED_SERVER,
+                'label' => 'Server Error',
+                'suggestion' => 'The server is returning an error. This may be temporary; if it persists, the feed may have been removed.',
+            ];
+        }
+        return [
+            'type' => self::ISSUE_FEED_OTHER,
+            'label' => 'Fetch Error',
+            'suggestion' => 'An unexpected error occurred fetching this feed. Verify the URL is still a valid RSS/Atom feed.',
+        ];
+    }
+
+    private function get_or_create_health_label(int $owner_uid): ?int
+    {
+        $pdo = Db::pdo();
+        $caption = self::FEED_HEALTH_LABEL;
+
+        $sth = $pdo->prepare("SELECT id FROM ttrss_labels2 WHERE caption = ? AND owner_uid = ?");
+        $sth->execute([$caption, $owner_uid]);
+        $row = $sth->fetch();
+        if ($row) {
+            return (int)$row['id'];
+        }
+
+        $sth = $pdo->prepare("
+            INSERT INTO ttrss_labels2 (caption, owner_uid, fg_color, bg_color)
+            VALUES (?, ?, '#ffffff', '#c0392b')
+            RETURNING id
+        ");
+        $sth->execute([$caption, $owner_uid]);
+        $id = $sth->fetchColumn();
+        return $id ? (int)$id : null;
+    }
+
+    private function apply_label_to_entry(int $article_id, int $label_id): void
+    {
+        $pdo = Db::pdo();
+        $sth = $pdo->prepare("
+            INSERT INTO ttrss_user_labels2 (label_id, article_id)
+            VALUES (?, ?)
+            ON CONFLICT DO NOTHING
+        ");
+        $sth->execute([$label_id, $article_id]);
     }
 
     /**
@@ -878,8 +1219,10 @@ class Af_Feed_Advisor extends Plugin
         $content .= "</div>";
 
         // Create the advisory article
+        $current_hour = (int)date('H');
+        $window = ($current_hour < 12) ? 'morning' : 'evening';
         $title = "System Health Report - {$timestamp}";
-        $guid = "feed-advisor:system-health:" . time();
+        $guid = 'feed-advisor:system-health:' . date('Y-m-d') . '-' . $window;
         $link = "about:feed-advisor#system-health";
         $content_hash = 'SHA1:' . sha1($content);
 
@@ -887,15 +1230,22 @@ class Af_Feed_Advisor extends Plugin
             $sth = $pdo->prepare('
                 INSERT INTO ttrss_entries (title, guid, link, content, content_hash, updated, date_entered, date_updated)
                 VALUES (?, ?, ?, ?, ?, NOW(), NOW(), NOW())
+                ON CONFLICT (guid) DO NOTHING
                 RETURNING id
             ');
             $sth->execute([$title, $guid, $link, $content, $content_hash]);
-            $entry_id = $sth->fetch(PDO::FETCH_COLUMN);
+            $entry_id = $sth->fetchColumn();
+
+            if (!$entry_id) {
+                Debug::log("Feed Advisor: System health advisory for this window already exists, skipping");
+                return;
+            }
 
             // Link to user entries (owner_uid = 1)
             $sth = $pdo->prepare('
                 INSERT INTO ttrss_user_entries (ref_id, feed_id, owner_uid, unread, marked, published, uuid, tag_cache, label_cache)
                 VALUES (?, NULL, 1, true, false, false, \'\', \'\', \'{"no-labels":1}\')
+                ON CONFLICT DO NOTHING
             ');
             $sth->execute([$entry_id]);
 
@@ -942,6 +1292,50 @@ class Af_Feed_Advisor extends Plugin
         print "<input dojoType='dijit.form.TextBox' style='display:none' name='method' value='save'>";
         print "<input dojoType='dijit.form.TextBox' style='display:none' name='plugin' value='af_feed_advisor'>";
 
+        // Feed health monitoring (load before form so values are available)
+        $pdo = Db::pdo();
+        $sth = $pdo->query("
+            SELECT date_entered FROM ttrss_entries
+            WHERE guid LIKE 'feed-advisor:health-report:%'
+            ORDER BY date_entered DESC LIMIT 1
+        ");
+        $last_health_row = $sth->fetch();
+        $last_health_str = $last_health_row ? $last_health_row['date_entered'] : 'Never';
+
+        $broken_days = $this->get_broken_days();
+        $stale_days = $this->get_stale_days();
+        $report_interval_hours = $this->get_report_interval_hours();
+
+        $sth = $pdo->query("
+            SELECT COUNT(*) FROM ttrss_feeds
+            WHERE last_error != ''
+              AND (last_successful_update IS NULL
+                   OR last_successful_update < NOW() - INTERVAL '{$broken_days} days')
+        ");
+        $broken_count = (int)$sth->fetchColumn();
+
+        $sth = $pdo->query("
+            SELECT COUNT(*) FROM (
+                SELECT f.id
+                FROM ttrss_feeds f
+                JOIN ttrss_user_entries ue ON ue.feed_id = f.id
+                JOIN ttrss_entries e ON e.id = ue.ref_id
+                WHERE (f.last_error = '' OR f.last_error IS NULL)
+                  AND f.feed_url NOT LIKE 'share-anything:%'
+                GROUP BY f.id
+                HAVING MAX(e.updated) < NOW() - INTERVAL '{$stale_days} days'
+            ) stale
+        ");
+        $stale_count = (int)$sth->fetchColumn();
+
+        $interval_options = [
+            1   => __('Hourly'),
+            6   => __('Every 6 hours'),
+            12  => __('Twice daily'),
+            24  => __('Daily'),
+            168 => __('Weekly'),
+        ];
+
         print "<table>";
 
         print "<tr><td width='40%'>" . __("Enable feed analysis") . "</td>";
@@ -950,10 +1344,28 @@ class Af_Feed_Advisor extends Plugin
         print "<tr><td width='40%'>" . __("Automatically apply recommendations") . "</td>";
         print "<td><input dojoType='dijit.form.CheckBox' name='auto_apply' " . ($auto_apply ? "checked='checked'" : "") . "></td></tr>";
 
+        print "<tr><td colspan='2'><h3 style='margin-bottom:4px'>Feed Health Monitoring</h3></td></tr>";
+
+        print "<tr><td width='40%'><strong>Report frequency</strong></td><td>";
+        print "<select dojoType='dijit.form.Select' name='report_interval_hours' style='width:160px'>";
+        foreach ($interval_options as $hours => $label) {
+            $selected = ($hours === $report_interval_hours) ? " selected='selected'" : '';
+            print "<option value='{$hours}'{$selected}>{$label}</option>";
+        }
+        print "</select></td></tr>";
+
+        print "<tr><td><strong>Broken feed threshold (days)</strong></td>";
+        print "<td><input dojoType='dijit.form.NumberSpinner' name='broken_days' value='{$broken_days}'" .
+              " constraints='{min:1,max:365}' style='width:80px'></td></tr>";
+
+        print "<tr><td><strong>Stale feed threshold (days)</strong></td>";
+        print "<td><input dojoType='dijit.form.NumberSpinner' name='stale_days' value='{$stale_days}'" .
+              " constraints='{min:30,max:3650}' style='width:80px'></td></tr>";
+
         print "</table>";
 
         print "<p><button dojoType='dijit.form.Button' type='submit'>" .
-            __("Save") . "</button>";
+            __("Save") . "</button></p>";
 
         print "</form>";
 
@@ -962,13 +1374,21 @@ class Af_Feed_Advisor extends Plugin
         $last_check = $state['last_log_check'] ?? 0;
         $last_check_str = $last_check ? date('Y-m-d H:i:s', $last_check) : 'Never';
 
-        print "<h3>System Health Monitoring</h3>";
-        print "<p>Feed Advisor automatically monitors TT-RSS logs for errors, warnings, and exceptions.</p>";
+        print "<h3>System Log Monitoring</h3>";
+        print "<p>Reads Docker logs twice daily and creates advisory articles for errors, warnings, and exceptions.</p>";
         print "<ul>";
-        print "<li><strong>Schedule:</strong> Twice daily (6am and 6pm)</li>";
+        print "<li><strong>Schedule:</strong> Twice daily (6am and 6pm) - not configurable</li>";
         print "<li><strong>Last check:</strong> {$last_check_str}</li>";
-        print "<li><strong>Monitoring:</strong> Last 12 hours of Docker logs</li>";
         print "</ul>";
+
+        print "<h3>Feed Health Status</h3>";
+        print "<ul>";
+        print "<li><strong>Last report:</strong> {$last_health_str}</li>";
+        print "<li><strong>Currently broken feeds:</strong> {$broken_count}</li>";
+        print "<li><strong>Currently stale feeds:</strong> {$stale_count}</li>";
+        print "</ul>";
+        print "<p><button dojoType='dijit.form.Button' onclick='return Plugins.Af_Feed_Advisor.checkHealthNow()'>" .
+            __("Check Feed Health Now") . "</button></p>";
 
         // Bulk operations
         print "<h2>Bulk Operations</h2>";
@@ -1015,85 +1435,47 @@ class Af_Feed_Advisor extends Plugin
         }
 
         print "</div>";
+    }
 
-        // JavaScript must be outside the accordion pane div so Dojo executes it
-        print "<script type='text/javascript'>";
-        print "if (!Plugins.Af_Feed_Advisor) Plugins.Af_Feed_Advisor = {};";
+    function get_prefs_js()
+    {
+        return "if (!Plugins.Af_Feed_Advisor) Plugins.Af_Feed_Advisor = {};
 
-        print "Plugins.Af_Feed_Advisor.bulkAnalyze = function() {
+        Plugins.Af_Feed_Advisor.bulkAnalyze = function() {
             Notify.progress('Analyzing all feeds...', true);
-            new Ajax.Request('backend.php', {
-                parameters: {
-                    op: 'pluginhandler',
-                    plugin: 'af_feed_advisor',
-                    method: 'bulkAnalyze'
-                },
-                onComplete: function(transport) {
-                    Notify.close();
-                    var response = JSON.parse(transport.responseText);
-                    Notify.info('Created ' + response.created + ' advisories');
-                    window.location.reload();
-                }
-            });
+            xhr.json('backend.php', {op: 'PluginHandler', plugin: 'af_feed_advisor', method: 'bulkAnalyze'})
+                .then(function(r) { Notify.info('Created ' + r.created + ' advisories'); });
             return false;
-        };";
+        };
 
-        print "Plugins.Af_Feed_Advisor.bulkApply = function() {
+        Plugins.Af_Feed_Advisor.bulkApply = function() {
             if (!confirm('Apply all pending recommendations?')) return false;
             Notify.progress('Applying recommendations...', true);
-            new Ajax.Request('backend.php', {
-                parameters: {
-                    op: 'pluginhandler',
-                    plugin: 'af_feed_advisor',
-                    method: 'bulkApplyRecommendations'
-                },
-                onComplete: function(transport) {
-                    Notify.close();
-                    var response = JSON.parse(transport.responseText);
-                    Notify.info('Applied ' + response.disabled + ' disables and ' + response.enabled + ' enables');
-                    window.location.reload();
-                }
-            });
+            xhr.json('backend.php', {op: 'PluginHandler', plugin: 'af_feed_advisor', method: 'bulkApplyRecommendations'})
+                .then(function(r) { Notify.info('Applied ' + r.disabled + ' disables and ' + r.enabled + ' enables'); });
             return false;
-        };";
+        };
 
-        print "Plugins.Af_Feed_Advisor.applyOne = function(feedId) {
+        Plugins.Af_Feed_Advisor.applyOne = function(feedId) {
             Notify.progress('Applying recommendation...', true);
-            new Ajax.Request('backend.php', {
-                parameters: {
-                    op: 'pluginhandler',
-                    plugin: 'af_feed_advisor',
-                    method: 'applyOne',
-                    feed_id: feedId
-                },
-                onComplete: function(transport) {
-                    Notify.close();
-                    Notify.info(transport.responseText);
-                    window.location.reload();
-                }
-            });
+            xhr.post('backend.php', {op: 'PluginHandler', plugin: 'af_feed_advisor', method: 'applyOne', feed_id: feedId})
+                .then(function(r) { Notify.info(r); });
             return false;
-        };";
+        };
 
-        print "Plugins.Af_Feed_Advisor.dismissOne = function(feedId) {
+        Plugins.Af_Feed_Advisor.dismissOne = function(feedId) {
             Notify.progress('Dismissing advisory...', true);
-            new Ajax.Request('backend.php', {
-                parameters: {
-                    op: 'pluginhandler',
-                    plugin: 'af_feed_advisor',
-                    method: 'dismissOne',
-                    feed_id: feedId
-                },
-                onComplete: function(transport) {
-                    Notify.close();
-                    Notify.info(transport.responseText);
-                    window.location.reload();
-                }
-            });
+            xhr.post('backend.php', {op: 'PluginHandler', plugin: 'af_feed_advisor', method: 'dismissOne', feed_id: feedId})
+                .then(function(r) { Notify.info(r); });
+            return false;
+        };
+
+        Plugins.Af_Feed_Advisor.checkHealthNow = function() {
+            Notify.progress('Checking feed health...', true);
+            xhr.json('backend.php', {op: 'PluginHandler', plugin: 'af_feed_advisor', method: 'checkHealthNow'})
+                .then(function(r) { Notify.info('Health check complete: ' + r.created + ' new advisories created.'); });
             return false;
         };";
-
-        print "</script>";
     }
 
     /**
@@ -1103,9 +1485,19 @@ class Af_Feed_Advisor extends Plugin
     {
         $enabled = checkbox_to_sql_bool($_POST['enabled'] ?? '');
         $auto_apply = checkbox_to_sql_bool($_POST['auto_apply'] ?? '');
+        $broken_days = max(1, (int)($_POST['broken_days'] ?? self::FEED_HEALTH_BROKEN_DAYS));
+        $stale_days = max(30, (int)($_POST['stale_days'] ?? self::FEED_STALE_DAYS));
+        $valid_intervals = [1, 6, 12, 24, 168];
+        $report_interval_hours = (int)($_POST['report_interval_hours'] ?? self::REPORT_INTERVAL_HOURS);
+        if (!in_array($report_interval_hours, $valid_intervals)) {
+            $report_interval_hours = self::REPORT_INTERVAL_HOURS;
+        }
 
         $this->host->set($this, 'enabled', $enabled);
         $this->host->set($this, 'auto_apply', $auto_apply);
+        $this->host->set($this, 'broken_days', $broken_days);
+        $this->host->set($this, 'stale_days', $stale_days);
+        $this->host->set($this, 'report_interval_hours', $report_interval_hours);
 
         echo __("Configuration saved.");
     }
@@ -1118,6 +1510,16 @@ class Af_Feed_Advisor extends Plugin
         $result = $this->bulk_analyze();
         header('Content-Type: application/json');
         echo json_encode($result);
+    }
+
+    /**
+     * AJAX handler: Run feed health check immediately
+     */
+    function checkHealthNow()
+    {
+        $created = $this->check_feed_health((int)$_SESSION['uid']);
+        header('Content-Type: application/json');
+        echo json_encode(['created' => $created]);
     }
 
     /**
