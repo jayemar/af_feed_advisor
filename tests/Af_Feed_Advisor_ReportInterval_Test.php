@@ -61,18 +61,20 @@ class Af_Feed_Advisor_ReportInterval_Test extends TestCase
     }
 
     // -------------------------------------------------------------------------
-    // Helper: build a plugin instance with a specific last_health_check state
-    // and a specific interval
+    // Helper: build a plugin instance with a specific interval
     // -------------------------------------------------------------------------
 
     private function pluginWithHealthState(int $last_health_check, int $interval_hours = 12): Af_Feed_Advisor
     {
-        $state = json_encode(['last_health_check' => $last_health_check]);
-        $host  = $this->createMock(\PluginHost::class);
+        return $this->pluginWithInterval($interval_hours);
+    }
+
+    private function pluginWithInterval(int $interval_hours = 12): Af_Feed_Advisor
+    {
+        $host = $this->createMock(\PluginHost::class);
         $host->method('add_hook')->willReturn(true);
         $host->method('get')->willReturnCallback(
-            function ($plugin, $key, $default) use ($state, $interval_hours) {
-                if ($key === 'state') return $state;
+            function ($plugin, $key, $default) use ($interval_hours) {
                 if ($key === 'report_interval_hours') return $interval_hours;
                 return $default;
             }
@@ -82,12 +84,12 @@ class Af_Feed_Advisor_ReportInterval_Test extends TestCase
         return $plugin;
     }
 
-    private function callShouldCheckHealth(Af_Feed_Advisor $plugin, int $now): bool
+    private function callShouldCheckHealth(Af_Feed_Advisor $plugin, int $now, int $last_run = 0): bool
     {
         $ref = new ReflectionClass($plugin);
         $m   = $ref->getMethod('should_check_health');
         $m->setAccessible(true);
-        return (bool)$m->invoke($plugin, $now);
+        return (bool)$m->invoke($plugin, $now, $last_run);
     }
 
     // =========================================================================
@@ -147,67 +149,67 @@ class Af_Feed_Advisor_ReportInterval_Test extends TestCase
 
     public function test_health_check_runs_when_never_previously_run(): void
     {
-        // last_health_check = 0 (never), any realistic $now satisfies the interval
-        $plugin = $this->pluginWithHealthState(0, 12);
-        $this->assertTrue($this->callShouldCheckHealth($plugin, self::NOW));
+        // last_run=0 (never), any realistic $now satisfies the interval
+        $plugin = $this->pluginWithInterval(12);
+        $this->assertTrue($this->callShouldCheckHealth($plugin, self::NOW, 0));
     }
 
     public function test_health_check_runs_when_interval_has_elapsed_12h(): void
     {
-        $interval_s = 12 * 3600; // 43200
+        $interval_s = 12 * 3600;
         $last_run   = self::NOW - $interval_s;
-        $plugin     = $this->pluginWithHealthState($last_run, 12);
-        $this->assertTrue($this->callShouldCheckHealth($plugin, self::NOW));
+        $plugin     = $this->pluginWithInterval(12);
+        $this->assertTrue($this->callShouldCheckHealth($plugin, self::NOW, $last_run));
     }
 
     public function test_health_check_skipped_when_interval_not_elapsed_12h(): void
     {
-        $interval_s = 12 * 3600; // 43200
+        $interval_s = 12 * 3600;
         $last_run   = self::NOW - $interval_s + 1; // one second short
-        $plugin     = $this->pluginWithHealthState($last_run, 12);
-        $this->assertFalse($this->callShouldCheckHealth($plugin, self::NOW));
+        $plugin     = $this->pluginWithInterval(12);
+        $this->assertFalse($this->callShouldCheckHealth($plugin, self::NOW, $last_run));
     }
 
     public function test_health_check_runs_when_interval_has_elapsed_1h(): void
     {
         $last_run = self::NOW - 3600;
-        $plugin   = $this->pluginWithHealthState($last_run, 1);
-        $this->assertTrue($this->callShouldCheckHealth($plugin, self::NOW));
+        $plugin   = $this->pluginWithInterval(1);
+        $this->assertTrue($this->callShouldCheckHealth($plugin, self::NOW, $last_run));
     }
 
     public function test_health_check_skipped_when_interval_not_elapsed_1h(): void
     {
         $last_run = self::NOW - 3599; // one second short of 1h
-        $plugin   = $this->pluginWithHealthState($last_run, 1);
-        $this->assertFalse($this->callShouldCheckHealth($plugin, self::NOW));
+        $plugin   = $this->pluginWithInterval(1);
+        $this->assertFalse($this->callShouldCheckHealth($plugin, self::NOW, $last_run));
     }
 
     public function test_health_check_runs_when_interval_has_elapsed_24h(): void
     {
         $last_run = self::NOW - 24 * 3600;
-        $plugin   = $this->pluginWithHealthState($last_run, 24);
-        $this->assertTrue($this->callShouldCheckHealth($plugin, self::NOW));
+        $plugin   = $this->pluginWithInterval(24);
+        $this->assertTrue($this->callShouldCheckHealth($plugin, self::NOW, $last_run));
     }
 
     public function test_health_check_skipped_when_interval_not_elapsed_24h(): void
     {
         $last_run = self::NOW - (24 * 3600 - 1);
-        $plugin   = $this->pluginWithHealthState($last_run, 24);
-        $this->assertFalse($this->callShouldCheckHealth($plugin, self::NOW));
+        $plugin   = $this->pluginWithInterval(24);
+        $this->assertFalse($this->callShouldCheckHealth($plugin, self::NOW, $last_run));
     }
 
     public function test_health_check_runs_when_interval_has_elapsed_weekly(): void
     {
         $last_run = self::NOW - 168 * 3600;
-        $plugin   = $this->pluginWithHealthState($last_run, 168);
-        $this->assertTrue($this->callShouldCheckHealth($plugin, self::NOW));
+        $plugin   = $this->pluginWithInterval(168);
+        $this->assertTrue($this->callShouldCheckHealth($plugin, self::NOW, $last_run));
     }
 
     public function test_health_check_skipped_when_interval_not_elapsed_weekly(): void
     {
         $last_run = self::NOW - (168 * 3600 - 1);
-        $plugin   = $this->pluginWithHealthState($last_run, 168);
-        $this->assertFalse($this->callShouldCheckHealth($plugin, self::NOW));
+        $plugin   = $this->pluginWithInterval(168);
+        $this->assertFalse($this->callShouldCheckHealth($plugin, self::NOW, $last_run));
     }
 
     // =========================================================================
