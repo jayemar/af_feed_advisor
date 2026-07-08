@@ -94,7 +94,7 @@ class Af_Feed_Advisor extends Plugin
     function hook_house_keeping()
     {
         if ($this->is_enabled()) {
-            if ($this->should_check_logs()) {
+            if ($this->is_system_health_enabled() && $this->should_check_logs()) {
                 $this->check_system_logs();
             }
             if ($this->should_check_health()) {
@@ -102,9 +102,6 @@ class Af_Feed_Advisor extends Plugin
                 foreach ($sth->fetchAll(PDO::FETCH_COLUMN) as $uid) {
                     $this->check_feed_health((int)$uid);
                 }
-                $state = $this->get_state();
-                $state['last_health_check'] = time();
-                $this->set_state($state);
             }
         }
     }
@@ -123,6 +120,22 @@ class Af_Feed_Advisor extends Plugin
     private function is_auto_apply_enabled()
     {
         return sql_bool_to_bool($this->host->get($this, 'auto_apply', false));
+    }
+
+    /**
+     * Check if enclosure display advisory is enabled
+     */
+    private function is_enclosure_check_enabled()
+    {
+        return sql_bool_to_bool($this->host->get($this, 'enclosure_check', true));
+    }
+
+    /**
+     * Check if system health reports are enabled
+     */
+    private function is_system_health_enabled()
+    {
+        return sql_bool_to_bool($this->host->get($this, 'system_health', true));
     }
 
     /**
@@ -260,8 +273,8 @@ class Af_Feed_Advisor extends Plugin
             }
         }
 
-        // Create advisory if we have a recommendation
-        if ($analysis['recommendation'] !== null) {
+        // Create advisory if we have a recommendation and enclosure checking is enabled
+        if ($analysis['recommendation'] !== null && $this->is_enclosure_check_enabled()) {
             // If auto-apply is enabled, apply the recommendation directly
             if ($this->is_auto_apply_enabled()) {
                 $this->apply_recommendation($analysis['feed_id'], $analysis['recommendation'], $analysis['reason']);
@@ -673,23 +686,30 @@ class Af_Feed_Advisor extends Plugin
     }
 
     /**
-     * Check if we should run log monitoring (twice daily: 6am and 6pm)
+     * Check if we should run log monitoring (once daily, at midnight UTC).
+     * The container runs on UTC (confirmed via `docker compose exec app date`),
+     * so date('H') here is already the UTC hour - no conversion needed.
+     *
+     * $already_reported_today lets tests bypass the DB dedup lookup (mirrors
+     * should_check_health()'s $last_run param); leave null in production so
+     * it always checks the DB.
      */
-    private function should_check_logs()
+    private function should_check_logs(?int $now = null, ?bool $already_reported_today = null)
     {
-        $current_hour = (int)date('H');
+        $now = $now ?? time();
+        $current_hour = (int)date('H', $now);
 
-        $is_morning_window = ($current_hour >= 6 && $current_hour < 7);
-        $is_evening_window = ($current_hour >= 18 && $current_hour < 19);
-
-        if (!$is_morning_window && !$is_evening_window) {
+        if ($current_hour !== 0) {
             return false;
+        }
+
+        if ($already_reported_today !== null) {
+            return !$already_reported_today;
         }
 
         try {
             $pdo = Db::pdo();
-            $window = ($current_hour < 12) ? 'morning' : 'evening';
-            $guid = 'feed-advisor:system-health:' . date('Y-m-d') . '-' . $window;
+            $guid = 'feed-advisor:system-health:' . date('Y-m-d', $now);
             $sth = $pdo->prepare("SELECT COUNT(*) FROM ttrss_entries WHERE guid = ?");
             $sth->execute([$guid]);
             return (int)$sth->fetchColumn() === 0;
@@ -745,10 +765,27 @@ class Af_Feed_Advisor extends Plugin
         return in_array($v, $valid) ? $v : self::REPORT_INTERVAL_HOURS;
     }
 
-    private function should_check_health(?int $now = null): bool
+    private function get_last_health_check_time(): int
     {
-        $state = $this->get_state();
-        $last_run = (int)($state['last_health_check'] ?? 0);
+        try {
+            $pdo = Db::pdo();
+            $sth = $pdo->query(
+                "SELECT EXTRACT(EPOCH FROM date_entered)::int FROM ttrss_entries
+                 WHERE guid LIKE 'feed-advisor:health-report:%'
+                 ORDER BY date_entered DESC LIMIT 1"
+            );
+            $ts = $sth->fetchColumn();
+            return $ts !== false ? (int)$ts : 0;
+        } catch (Exception $e) {
+            return 0;
+        }
+    }
+
+    private function should_check_health(?int $now = null, ?int $last_run = null): bool
+    {
+        if ($last_run === null) {
+            $last_run = $this->get_last_health_check_time();
+        }
         $interval_seconds = $this->get_report_interval_hours() * 3600;
         return (($now ?? time()) - $last_run) >= $interval_seconds;
     }
@@ -1017,7 +1054,7 @@ class Af_Feed_Advisor extends Plugin
      */
     private function check_system_logs()
     {
-        // Parse Docker logs from the last 12 hours
+        // Parse Docker logs from the last 24 hours
         $issues = $this->parse_docker_logs();
 
         if (empty($issues)) {
@@ -1059,8 +1096,9 @@ class Af_Feed_Advisor extends Plugin
                 return $issues;
             }
 
-            // Read last 12 hours of logs from file
-            $twelve_hours_ago = time() - (12 * 3600);
+            // The time window is enforced by export-docker-logs.sh's `--since`
+            // flag when it writes this file, not here - we just read whatever
+            // range it exported.
             $output = array();
 
             $handle = fopen($log_file, 'r');
@@ -1172,7 +1210,7 @@ class Af_Feed_Advisor extends Plugin
         $content = "<div class='feed-advisor-article'>";
         $content .= "<h2>System Health Report</h2>";
         $content .= "<p><strong>Generated:</strong> {$timestamp}</p>";
-        $content .= "<p>This report summarizes errors, warnings, and exceptions from the last 12 hours.</p>";
+        $content .= "<p>This report summarizes errors, warnings, and exceptions from the last 24 hours.</p>";
 
         $total_issues = count($issues['exceptions']) + count($issues['errors']) + count($issues['warnings']);
 
@@ -1214,15 +1252,13 @@ class Af_Feed_Advisor extends Plugin
         }
 
         $content .= "<hr>";
-        $content .= "<p><small>Monitoring period: Last 12 hours<br>";
+        $content .= "<p><small>Monitoring period: Last 24 hours<br>";
         $content .= "Total issues: {$total_issues}</small></p>";
         $content .= "</div>";
 
         // Create the advisory article
-        $current_hour = (int)date('H');
-        $window = ($current_hour < 12) ? 'morning' : 'evening';
         $title = "System Health Report - {$timestamp}";
-        $guid = 'feed-advisor:system-health:' . date('Y-m-d') . '-' . $window;
+        $guid = 'feed-advisor:system-health:' . date('Y-m-d');
         $link = "about:feed-advisor#system-health";
         $content_hash = 'SHA1:' . sha1($content);
 
@@ -1237,7 +1273,7 @@ class Af_Feed_Advisor extends Plugin
             $entry_id = $sth->fetchColumn();
 
             if (!$entry_id) {
-                Debug::log("Feed Advisor: System health advisory for this window already exists, skipping");
+                Debug::log("Feed Advisor: System health advisory for today already exists, skipping");
                 return;
             }
 
@@ -1268,8 +1304,12 @@ class Af_Feed_Advisor extends Plugin
 
         print "<h2>Feed Advisor Settings</h2>";
 
+        print "<style>#af-advisor-save .dijitButtonNode { background: #1a73e8 !important; border-color: #1165c4 !important; } #af-advisor-save .dijitButtonText { color: #fff !important; }</style>";
+
         $enabled = $this->is_enabled();
         $auto_apply = $this->is_auto_apply_enabled();
+        $enclosure_check = $this->is_enclosure_check_enabled();
+        $system_health = $this->is_system_health_enabled();
 
         print "<form dojoType='dijit.form.Form'>";
 
@@ -1277,18 +1317,13 @@ class Af_Feed_Advisor extends Plugin
             evt.preventDefault();
             if (this.validate()) {
                 Notify.progress('Saving data...', true);
-
-                new Ajax.Request('backend.php', {
-                    parameters: dojo.objectToQuery(this.getValues()),
-                    onComplete: function(transport) {
-                        Notify.close();
-                        Notify.info(transport.responseText);
-                    }
+                xhr.post('backend.php', this.getValues(), (reply) => {
+                    Notify.info(reply);
                 });
             }
         </script>";
 
-        print "<input dojoType='dijit.form.TextBox' style='display:none' name='op' value='pluginhandler'>";
+        print "<input dojoType='dijit.form.TextBox' style='display:none' name='op' value='PluginHandler'>";
         print "<input dojoType='dijit.form.TextBox' style='display:none' name='method' value='save'>";
         print "<input dojoType='dijit.form.TextBox' style='display:none' name='plugin' value='af_feed_advisor'>";
 
@@ -1338,15 +1373,15 @@ class Af_Feed_Advisor extends Plugin
 
         print "<table>";
 
-        print "<tr><td width='40%'>" . __("Enable feed analysis") . "</td>";
+        print "<tr><td width='40%'><h3 style='margin:0'>" . __("Enable plugin") . "</h3></td>";
         print "<td><input dojoType='dijit.form.CheckBox' name='enabled' " . ($enabled ? "checked='checked'" : "") . "></td></tr>";
-
-        print "<tr><td width='40%'>" . __("Automatically apply recommendations") . "</td>";
-        print "<td><input dojoType='dijit.form.CheckBox' name='auto_apply' " . ($auto_apply ? "checked='checked'" : "") . "></td></tr>";
 
         print "<tr><td colspan='2'><h3 style='margin-bottom:4px'>Feed Health Monitoring</h3></td></tr>";
 
-        print "<tr><td width='40%'><strong>Report frequency</strong></td><td>";
+        print "<tr><td width='40%'>" . __("Generate system health reports") . "</td>";
+        print "<td><input dojoType='dijit.form.CheckBox' name='system_health' " . ($system_health ? "checked='checked'" : "") . "></td></tr>";
+
+        print "<tr><td width='40%'>Report frequency</td><td>";
         print "<select dojoType='dijit.form.Select' name='report_interval_hours' style='width:160px'>";
         foreach ($interval_options as $hours => $label) {
             $selected = ($hours === $report_interval_hours) ? " selected='selected'" : '';
@@ -1354,17 +1389,25 @@ class Af_Feed_Advisor extends Plugin
         }
         print "</select></td></tr>";
 
-        print "<tr><td><strong>Broken feed threshold (days)</strong></td>";
+        print "<tr><td>Broken feed threshold (days)</td>";
         print "<td><input dojoType='dijit.form.NumberSpinner' name='broken_days' value='{$broken_days}'" .
               " constraints='{min:1,max:365}' style='width:80px'></td></tr>";
 
-        print "<tr><td><strong>Stale feed threshold (days)</strong></td>";
+        print "<tr><td>Stale feed threshold (days)</td>";
         print "<td><input dojoType='dijit.form.NumberSpinner' name='stale_days' value='{$stale_days}'" .
               " constraints='{min:30,max:3650}' style='width:80px'></td></tr>";
 
+        print "<tr><td colspan='2'><h3 style='margin-bottom:4px'>Feed Enclosure Settings</h3></td></tr>";
+
+        print "<tr><td width='40%'>" . __("Advise on enclosure display settings") . "</td>";
+        print "<td><input dojoType='dijit.form.CheckBox' name='enclosure_check' " . ($enclosure_check ? "checked='checked'" : "") . "></td></tr>";
+
+        print "<tr><td width='40%'>" . __("Automatically apply recommendations") . "</td>";
+        print "<td><input dojoType='dijit.form.CheckBox' name='auto_apply' " . ($auto_apply ? "checked='checked'" : "") . "></td></tr>";
+
         print "</table>";
 
-        print "<p><button dojoType='dijit.form.Button' type='submit'>" .
+        print "<p id='af-advisor-save'><button dojoType='dijit.form.Button' type='submit'>" .
             __("Save") . "</button></p>";
 
         print "</form>";
@@ -1375,9 +1418,9 @@ class Af_Feed_Advisor extends Plugin
         $last_check_str = $last_check ? date('Y-m-d H:i:s', $last_check) : 'Never';
 
         print "<h3>System Log Monitoring</h3>";
-        print "<p>Reads Docker logs twice daily and creates advisory articles for errors, warnings, and exceptions.</p>";
+        print "<p>Reads Docker logs once daily and creates advisory articles for errors, warnings, and exceptions.</p>";
         print "<ul>";
-        print "<li><strong>Schedule:</strong> Twice daily (6am and 6pm) - not configurable</li>";
+        print "<li><strong>Schedule:</strong> Once daily at midnight UTC - not configurable</li>";
         print "<li><strong>Last check:</strong> {$last_check_str}</li>";
         print "</ul>";
 
@@ -1493,8 +1536,13 @@ class Af_Feed_Advisor extends Plugin
             $report_interval_hours = self::REPORT_INTERVAL_HOURS;
         }
 
+        $enclosure_check = checkbox_to_sql_bool($_POST['enclosure_check'] ?? '');
+        $system_health = checkbox_to_sql_bool($_POST['system_health'] ?? '');
+
         $this->host->set($this, 'enabled', $enabled);
         $this->host->set($this, 'auto_apply', $auto_apply);
+        $this->host->set($this, 'enclosure_check', $enclosure_check);
+        $this->host->set($this, 'system_health', $system_health);
         $this->host->set($this, 'broken_days', $broken_days);
         $this->host->set($this, 'stale_days', $stale_days);
         $this->host->set($this, 'report_interval_hours', $report_interval_hours);
