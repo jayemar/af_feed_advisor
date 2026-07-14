@@ -36,7 +36,8 @@ class Af_Feed_Advisor extends Plugin
     const FEED_HEALTH_LABEL = 'feed-health';
     const FEED_HEALTH_BROKEN_DAYS = 7;
     const FEED_STALE_DAYS = 365;
-    const REPORT_INTERVAL_HOURS = 12;
+    const REPORT_INTERVAL_HOURS = 24;
+    const SYSTEM_CHECK_INTERVAL_HOURS = 24;
 
     function about()
     {
@@ -136,6 +137,24 @@ class Af_Feed_Advisor extends Plugin
     private function is_system_health_enabled()
     {
         return sql_bool_to_bool($this->host->get($this, 'system_health', true));
+    }
+
+    /**
+     * Check if feed health reports should be skipped when there's nothing to report
+     */
+    private function is_quiet_when_clean_enabled()
+    {
+        return sql_bool_to_bool($this->host->get($this, 'quiet_when_clean', false));
+    }
+
+    /**
+     * Check if system health reports should be skipped when there are no log
+     * errors/warnings/exceptions to report. Defaults to true, matching this
+     * report's original always-quiet behavior.
+     */
+    private function is_system_quiet_when_clean_enabled()
+    {
+        return sql_bool_to_bool($this->host->get($this, 'system_quiet_when_clean', true));
     }
 
     /**
@@ -419,7 +438,9 @@ class Af_Feed_Advisor extends Plugin
      */
     private function get_state()
     {
-        $state_json = $this->host->get($this, 'state', '{}');
+        // Reuses get_plugin_setting()'s existing daemon-context fallback -
+        // see set_state() below for why that fallback is needed at all.
+        $state_json = $this->get_plugin_setting('state', '{}');
         return json_decode($state_json, true) ?: array();
     }
 
@@ -428,7 +449,53 @@ class Af_Feed_Advisor extends Plugin
      */
     private function set_state($state)
     {
-        $this->host->set($this, 'state', json_encode($state));
+        $content = json_encode($state);
+        $this->host->set($this, 'state', $content);
+
+        // PluginHost::set()/save_data() only ever persists to the database
+        // when running inside a real user session (owner_uid set) - it
+        // silently no-ops during housekeeping/updater runs (owner_uid=0),
+        // which is exactly when this is called for schedule bookkeeping
+        // (last_log_check) and per-article advisories recorded during
+        // normal feed updates. Without this fallback those writes vanish
+        // the moment that process exits - "Last check" showed "Never"
+        // forever despite system health reports arriving daily, because
+        // the report itself is a raw SQL insert (unaffected) but the
+        // bookkeeping write above was silently dropped. Mirrors
+        // get_plugin_setting()'s existing admin-fallback convention. Only
+        // do this when there's no real owner_uid, so a genuine per-user
+        // session (e.g. uid=2) never clobbers uid=1's own state.
+        if ($this->host->get_owner_uid()) {
+            return;
+        }
+
+        try {
+            $pdo = Db::pdo();
+            $sth = $pdo->prepare(
+                "SELECT content FROM ttrss_plugin_storage WHERE name = 'Af_Feed_Advisor' AND owner_uid = 1"
+            );
+            $sth->execute();
+            $row = $sth->fetch();
+
+            $stored = $row ? unserialize($row['content']) : [];
+            if (!is_array($stored)) {
+                $stored = [];
+            }
+            $stored['state'] = $content;
+            $serialized = serialize($stored);
+
+            if ($row) {
+                $pdo->prepare(
+                    "UPDATE ttrss_plugin_storage SET content = ? WHERE name = 'Af_Feed_Advisor' AND owner_uid = 1"
+                )->execute([$serialized]);
+            } else {
+                $pdo->prepare(
+                    "INSERT INTO ttrss_plugin_storage (name, owner_uid, content) VALUES ('Af_Feed_Advisor', 1, ?)"
+                )->execute([$serialized]);
+            }
+        } catch (Exception $e) {
+            Debug::log("Feed Advisor: Failed to persist state in daemon context: " . $e->getMessage());
+        }
     }
 
     /**
@@ -686,37 +753,18 @@ class Af_Feed_Advisor extends Plugin
     }
 
     /**
-     * Check if we should run log monitoring (once daily, at midnight UTC).
-     * The container runs on UTC (confirmed via `docker compose exec app date`),
-     * so date('H') here is already the UTC hour - no conversion needed.
-     *
-     * $already_reported_today lets tests bypass the DB dedup lookup (mirrors
-     * should_check_health()'s $last_run param); leave null in production so
-     * it always checks the DB.
+     * Elapsed-time gate, same design as should_check_health() below: runs
+     * once get_system_check_interval_hours() worth of time has passed since
+     * the last check. $last_run lets tests bypass get_last_log_check_time()
+     * (which reads from state) for determinism; leave null in production.
      */
-    private function should_check_logs(?int $now = null, ?bool $already_reported_today = null)
+    private function should_check_logs(?int $now = null, ?int $last_run = null): bool
     {
-        $now = $now ?? time();
-        $current_hour = (int)date('H', $now);
-
-        if ($current_hour !== 0) {
-            return false;
+        if ($last_run === null) {
+            $last_run = $this->get_last_log_check_time();
         }
-
-        if ($already_reported_today !== null) {
-            return !$already_reported_today;
-        }
-
-        try {
-            $pdo = Db::pdo();
-            $guid = 'feed-advisor:system-health:' . date('Y-m-d', $now);
-            $sth = $pdo->prepare("SELECT COUNT(*) FROM ttrss_entries WHERE guid = ?");
-            $sth->execute([$guid]);
-            return (int)$sth->fetchColumn() === 0;
-        } catch (Exception $e) {
-            Debug::log("Feed Advisor: Failed to check for recent health report: " . $e->getMessage());
-            return false;
-        }
+        $interval_seconds = $this->get_system_check_interval_hours() * 3600;
+        return (($now ?? time()) - $last_run) >= $interval_seconds;
     }
 
     private function get_plugin_setting(string $key, $default)
@@ -790,7 +838,23 @@ class Af_Feed_Advisor extends Plugin
         return (($now ?? time()) - $last_run) >= $interval_seconds;
     }
 
-    private function check_feed_health(int $owner_uid): int
+    private function get_system_check_interval_hours(): int
+    {
+        $valid = [1, 6, 12, 24, 168];
+        $v = (int)$this->get_plugin_setting('system_check_interval_hours', self::SYSTEM_CHECK_INTERVAL_HOURS);
+        return in_array($v, $valid) ? $v : self::SYSTEM_CHECK_INTERVAL_HOURS;
+    }
+
+    // Unlike get_last_health_check_time() (which reads the timestamp off
+    // its own report article), system health's last-check time already
+    // lives in state (last_log_check) - reused directly here.
+    private function get_last_log_check_time(): int
+    {
+        $state = $this->get_state();
+        return (int)($state['last_log_check'] ?? 0);
+    }
+
+    private function check_feed_health(int $owner_uid, bool $force = false): int
     {
         $pdo = Db::pdo();
         $broken_days = $this->get_broken_days();
@@ -825,7 +889,7 @@ class Af_Feed_Advisor extends Plugin
         $sth->execute([$owner_uid]);
         $stale_feeds = $sth->fetchAll(PDO::FETCH_ASSOC);
 
-        $this->create_consolidated_health_advisory($broken_feeds, $stale_feeds, $owner_uid);
+        $this->create_consolidated_health_advisory($broken_feeds, $stale_feeds, $owner_uid, $force);
 
         $broken_count = count($broken_feeds);
         $stale_count = count($stale_feeds);
@@ -833,13 +897,19 @@ class Af_Feed_Advisor extends Plugin
         return $broken_count + $stale_count;
     }
 
-    private function create_consolidated_health_advisory(array $broken_feeds, array $stale_feeds, int $owner_uid): void
+    private function create_consolidated_health_advisory(array $broken_feeds, array $stale_feeds, int $owner_uid, bool $force = false): void
     {
+        $broken_count = count($broken_feeds);
+        $stale_count = count($stale_feeds);
+
+        if (!$force && $broken_count === 0 && $stale_count === 0 && $this->is_quiet_when_clean_enabled()) {
+            Debug::log("Feed Advisor: No feed issues for uid={$owner_uid}, skipping report (quiet mode).");
+            return;
+        }
+
         $pdo = Db::pdo();
         $timestamp = date('Y-m-d H:i:s');
         $guid = 'feed-advisor:health-report:' . date('Y-m-d-H-i-s') . '-uid' . $owner_uid;
-        $broken_count = count($broken_feeds);
-        $stale_count = count($stale_feeds);
         $broken_days = $this->get_broken_days();
         $stale_days = $this->get_stale_days();
 
@@ -1052,26 +1122,22 @@ class Af_Feed_Advisor extends Plugin
     /**
      * Check system logs for errors and warnings
      */
-    private function check_system_logs()
+    private function check_system_logs(bool $force = false): bool
     {
         // Parse Docker logs from the last 24 hours
         $issues = $this->parse_docker_logs();
+        $issues_found = !empty($issues['errors']) || !empty($issues['warnings']) || !empty($issues['exceptions']);
 
-        if (empty($issues)) {
-            // No issues found, update state and return
-            $state = $this->get_state();
-            $state['last_log_check'] = time();
-            $this->set_state($state);
-            return;
+        if ($force || $issues_found || !$this->is_system_quiet_when_clean_enabled()) {
+            $this->create_system_advisory($issues);
         }
-
-        // Create consolidated advisory
-        $this->create_system_advisory($issues);
 
         // Update state
         $state = $this->get_state();
         $state['last_log_check'] = time();
         $this->set_state($state);
+
+        return $issues_found;
     }
 
     /**
@@ -1256,9 +1322,14 @@ class Af_Feed_Advisor extends Plugin
         $content .= "Total issues: {$total_issues}</small></p>";
         $content .= "</div>";
 
-        // Create the advisory article
+        // Create the advisory article. GUID includes full timestamp (not
+        // just the date) so that check frequencies shorter than daily
+        // (hourly, every 6 hours, etc.) each get their own report instead
+        // of every same-day attempt after the first silently no-op'ing via
+        // the ON CONFLICT below - mirrors create_consolidated_health_advisory()'s
+        // per-second feed-health GUID.
         $title = "System Health Report - {$timestamp}";
-        $guid = 'feed-advisor:system-health:' . date('Y-m-d');
+        $guid = 'feed-advisor:system-health:' . date('Y-m-d-H-i-s');
         $link = "about:feed-advisor#system-health";
         $content_hash = 'SHA1:' . sha1($content);
 
@@ -1310,6 +1381,8 @@ class Af_Feed_Advisor extends Plugin
         $auto_apply = $this->is_auto_apply_enabled();
         $enclosure_check = $this->is_enclosure_check_enabled();
         $system_health = $this->is_system_health_enabled();
+        $quiet_when_clean = $this->is_quiet_when_clean_enabled();
+        $system_quiet_when_clean = $this->is_system_quiet_when_clean_enabled();
 
         print "<form dojoType='dijit.form.Form'>";
 
@@ -1340,6 +1413,7 @@ class Af_Feed_Advisor extends Plugin
         $broken_days = $this->get_broken_days();
         $stale_days = $this->get_stale_days();
         $report_interval_hours = $this->get_report_interval_hours();
+        $system_check_interval_hours = $this->get_system_check_interval_hours();
 
         $sth = $pdo->query("
             SELECT COUNT(*) FROM ttrss_feeds
@@ -1371,6 +1445,10 @@ class Af_Feed_Advisor extends Plugin
             168 => __('Weekly'),
         ];
 
+        $state = $this->get_state();
+        $last_check = $state['last_log_check'] ?? 0;
+        $last_check_str = $last_check ? date('Y-m-d H:i:s', $last_check) : 'Never';
+
         print "<table>";
 
         print "<tr><td width='40%'><h3 style='margin:0'>" . __("Enable plugin") . "</h3></td>";
@@ -1380,6 +1458,9 @@ class Af_Feed_Advisor extends Plugin
 
         print "<tr><td width='40%'>" . __("Generate system health reports") . "</td>";
         print "<td><input dojoType='dijit.form.CheckBox' name='system_health' " . ($system_health ? "checked='checked'" : "") . "></td></tr>";
+
+        print "<tr><td width='40%'>" . __("Only report when there's an issue") . "</td>";
+        print "<td><input dojoType='dijit.form.CheckBox' name='quiet_when_clean' " . ($quiet_when_clean ? "checked='checked'" : "") . "></td></tr>";
 
         print "<tr><td width='40%'>Report frequency</td><td>";
         print "<select dojoType='dijit.form.Select' name='report_interval_hours' style='width:160px'>";
@@ -1397,6 +1478,38 @@ class Af_Feed_Advisor extends Plugin
         print "<td><input dojoType='dijit.form.NumberSpinner' name='stale_days' value='{$stale_days}'" .
               " constraints='{min:30,max:3650}' style='width:80px'></td></tr>";
 
+        print "<tr><td colspan='2'><ul style='margin:4px 0'>" .
+            "<li><strong>" . __('Last report:') . "</strong> {$last_health_str}</li>" .
+            "<li><strong>" . __('Currently broken feeds:') . "</strong> {$broken_count}</li>" .
+            "<li><strong>" . __('Currently stale feeds:') . "</strong> {$stale_count}</li>" .
+            "</ul></td></tr>";
+
+        print "<tr><td colspan='2'><button dojoType='dijit.form.Button' onclick='return Plugins.Af_Feed_Advisor.checkHealthNow()'>" .
+            __("Check Feed Health Now") . "</button></td></tr>";
+
+        print "<tr><td colspan='2'><h3 style='margin-bottom:4px'>System Log Monitoring</h3></td></tr>";
+        print "<tr><td colspan='2'><p style='margin:4px 0'>" .
+            __('Reads Docker logs and creates advisory articles for errors, warnings, and exceptions.') .
+            "</p></td></tr>";
+
+        print "<tr><td width='40%'>" . __("Only report when there's an error") . "</td>";
+        print "<td><input dojoType='dijit.form.CheckBox' name='system_quiet_when_clean' " . ($system_quiet_when_clean ? "checked='checked'" : "") . "></td></tr>";
+
+        print "<tr><td width='40%'>Check frequency</td><td>";
+        print "<select dojoType='dijit.form.Select' name='system_check_interval_hours' style='width:160px'>";
+        foreach ($interval_options as $hours => $label) {
+            $selected = ($hours === $system_check_interval_hours) ? " selected='selected'" : '';
+            print "<option value='{$hours}'{$selected}>{$label}</option>";
+        }
+        print "</select></td></tr>";
+
+        print "<tr><td colspan='2'><ul style='margin:4px 0'>" .
+            "<li><strong>" . __('Last check:') . "</strong> {$last_check_str}</li>" .
+            "</ul></td></tr>";
+
+        print "<tr><td colspan='2'><button dojoType='dijit.form.Button' onclick='return Plugins.Af_Feed_Advisor.checkSystemHealthNow()'>" .
+            __("Check System Health Now") . "</button></td></tr>";
+
         print "<tr><td colspan='2'><h3 style='margin-bottom:4px'>Feed Enclosure Settings</h3></td></tr>";
 
         print "<tr><td width='40%'>" . __("Advise on enclosure display settings") . "</td>";
@@ -1411,27 +1524,6 @@ class Af_Feed_Advisor extends Plugin
             __("Save") . "</button></p>";
 
         print "</form>";
-
-        // System monitoring info
-        $state = $this->get_state();
-        $last_check = $state['last_log_check'] ?? 0;
-        $last_check_str = $last_check ? date('Y-m-d H:i:s', $last_check) : 'Never';
-
-        print "<h3>System Log Monitoring</h3>";
-        print "<p>Reads Docker logs once daily and creates advisory articles for errors, warnings, and exceptions.</p>";
-        print "<ul>";
-        print "<li><strong>Schedule:</strong> Once daily at midnight UTC - not configurable</li>";
-        print "<li><strong>Last check:</strong> {$last_check_str}</li>";
-        print "</ul>";
-
-        print "<h3>Feed Health Status</h3>";
-        print "<ul>";
-        print "<li><strong>Last report:</strong> {$last_health_str}</li>";
-        print "<li><strong>Currently broken feeds:</strong> {$broken_count}</li>";
-        print "<li><strong>Currently stale feeds:</strong> {$stale_count}</li>";
-        print "</ul>";
-        print "<p><button dojoType='dijit.form.Button' onclick='return Plugins.Af_Feed_Advisor.checkHealthNow()'>" .
-            __("Check Feed Health Now") . "</button></p>";
 
         // Bulk operations
         print "<h2>Bulk Operations</h2>";
@@ -1516,7 +1608,14 @@ class Af_Feed_Advisor extends Plugin
         Plugins.Af_Feed_Advisor.checkHealthNow = function() {
             Notify.progress('Checking feed health...', true);
             xhr.json('backend.php', {op: 'PluginHandler', plugin: 'af_feed_advisor', method: 'checkHealthNow'})
-                .then(function(r) { Notify.info('Health check complete: ' + r.created + ' new advisories created.'); });
+                .then(function(r) { Notify.info('Feed health report created (' + r.created + ' issue(s) found).'); });
+            return false;
+        };
+
+        Plugins.Af_Feed_Advisor.checkSystemHealthNow = function() {
+            Notify.progress('Checking system logs...', true);
+            xhr.json('backend.php', {op: 'PluginHandler', plugin: 'af_feed_advisor', method: 'checkSystemHealthNow'})
+                .then(function(r) { Notify.info('System health report created (' + (r.issues_found ? 'issues found' : 'all clear') + ').'); });
             return false;
         };";
     }
@@ -1535,17 +1634,26 @@ class Af_Feed_Advisor extends Plugin
         if (!in_array($report_interval_hours, $valid_intervals)) {
             $report_interval_hours = self::REPORT_INTERVAL_HOURS;
         }
+        $system_check_interval_hours = (int)($_POST['system_check_interval_hours'] ?? self::SYSTEM_CHECK_INTERVAL_HOURS);
+        if (!in_array($system_check_interval_hours, $valid_intervals)) {
+            $system_check_interval_hours = self::SYSTEM_CHECK_INTERVAL_HOURS;
+        }
 
         $enclosure_check = checkbox_to_sql_bool($_POST['enclosure_check'] ?? '');
         $system_health = checkbox_to_sql_bool($_POST['system_health'] ?? '');
+        $quiet_when_clean = checkbox_to_sql_bool($_POST['quiet_when_clean'] ?? '');
+        $system_quiet_when_clean = checkbox_to_sql_bool($_POST['system_quiet_when_clean'] ?? '');
 
         $this->host->set($this, 'enabled', $enabled);
         $this->host->set($this, 'auto_apply', $auto_apply);
         $this->host->set($this, 'enclosure_check', $enclosure_check);
         $this->host->set($this, 'system_health', $system_health);
+        $this->host->set($this, 'quiet_when_clean', $quiet_when_clean);
+        $this->host->set($this, 'system_quiet_when_clean', $system_quiet_when_clean);
         $this->host->set($this, 'broken_days', $broken_days);
         $this->host->set($this, 'stale_days', $stale_days);
         $this->host->set($this, 'report_interval_hours', $report_interval_hours);
+        $this->host->set($this, 'system_check_interval_hours', $system_check_interval_hours);
 
         echo __("Configuration saved.");
     }
@@ -1561,13 +1669,28 @@ class Af_Feed_Advisor extends Plugin
     }
 
     /**
-     * AJAX handler: Run feed health check immediately
+     * AJAX handler: Run feed health check immediately. Always creates a
+     * report, regardless of the "only report when there's an issue"
+     * setting - that setting only governs the automatic scheduled checks.
      */
     function checkHealthNow()
     {
-        $created = $this->check_feed_health((int)$_SESSION['uid']);
+        $created = $this->check_feed_health((int)$_SESSION['uid'], true);
         header('Content-Type: application/json');
         echo json_encode(['created' => $created]);
+    }
+
+    /**
+     * AJAX handler: Run the system log check immediately, bypassing the
+     * once-daily schedule. Always creates a report, regardless of the
+     * "only report when there's an error" setting - same rationale as
+     * checkHealthNow() above.
+     */
+    function checkSystemHealthNow()
+    {
+        $issues_found = $this->check_system_logs(true);
+        header('Content-Type: application/json');
+        echo json_encode(['issues_found' => $issues_found]);
     }
 
     /**

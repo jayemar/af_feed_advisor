@@ -9,8 +9,8 @@ directly in your TT-RSS instance.
   creating a consolidated report article tagged `feed-health`
 - **Enclosure analysis** - identifies feeds whose `always_display_enclosures` setting does
   not match their content, and recommends or auto-applies corrections
-- **System log monitoring** - reads Docker logs twice daily and surfaces errors, warnings,
-  and exceptions as advisory articles
+- **System log monitoring** - reads Docker logs on a configurable schedule and surfaces
+  errors, warnings, and exceptions as advisory articles
 - **Bulk operations** - analyze all feeds at once and apply all pending recommendations
   in one action
 - **Per-user isolation** - each user's health reports only reflect their own feeds
@@ -111,9 +111,13 @@ in the settings pane.
 
 ## System Log Monitoring
 
-Reads the Docker log file mounted at `/var/log/ttrss/docker.log` twice daily (6 - 7am
-and 6 - 7pm server time) and creates an advisory article if any exceptions, errors, or
-warnings are found. The schedule is fixed and not user-configurable.
+Reads the Docker log file mounted at `/var/log/ttrss/docker.log` on a configurable
+schedule (Hourly / Every 6 hours / Twice daily / Daily / Weekly - same options as feed
+health's report frequency, default Daily) and creates an advisory article if any
+exceptions, errors, or warnings are found. Like feed health, an "Only report when
+there's an error" checkbox controls whether a clean ("all clear") result still creates
+an article for the *automatic* scheduled check - manual "Check System Health Now" always
+creates one regardless.
 
 ### Required setup
 
@@ -128,10 +132,9 @@ warnings are found. The schedule is fixed and not user-configurable.
      - /tmp/ttrss-logs/docker.log:/var/log/ttrss/docker.log:ro
    ```
 
-3. Add a cron job to export logs five minutes before each check window:
-   ```
-   55 5,17 * * * /home/jayemar/projects/homelab/ttrss/scripts/export-docker-logs.sh
-   ```
+3. Add a cron job on the host to run `scripts/export-docker-logs.sh` at least as often
+   as your configured check frequency, so the log file it writes is never older than one
+   check interval when this plugin reads it.
 
 The plugin skips system log monitoring silently if the log file does not exist.
 
@@ -141,7 +144,7 @@ The plugin skips system log monitoring silently if the log file does not exist.
 |---|---|
 | Scheduled health report | `feed-advisor:health-report:YYYY-MM-DD-HH-ii-ss-uidN` |
 | Manual health report | same format, different timestamp |
-| System log advisory | `feed-advisor:system-health:YYYY-MM-DD-(morning\|evening)` |
+| System log advisory | `feed-advisor:system-health:YYYY-MM-DD-HH-ii-ss` |
 | Enclosure advisory | stored in plugin state, not a standalone entry |
 
 ## Troubleshooting

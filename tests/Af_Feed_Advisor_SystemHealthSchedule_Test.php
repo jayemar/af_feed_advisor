@@ -7,90 +7,222 @@ use PHPUnit\Framework\TestCase;
 use ReflectionClass;
 
 /**
- * Tests for should_check_logs() - the gate that decides whether the
- * Docker-log-based "System Health Report" (errors/warnings/exceptions) runs.
+ * Tests for the configurable system-log check frequency feature - mirrors
+ * Af_Feed_Advisor_ReportInterval_Test.php's coverage of feed health's own
+ * report_interval_hours, but for system_check_interval_hours.
  *
- * Schedule: once daily, at midnight UTC only (hour === 0). Previously ran
- * twice daily in fixed 6am/6pm windows; this now covers the single window.
+ * Covers:
+ *   - get_system_check_interval_hours() - setting retrieval and validation
+ *   - should_check_logs()                - elapsed-time gate logic
+ *   - save()                             - interval validation on persist
+ *
+ * should_check_logs() previously only ever ran once daily at UTC midnight
+ * (hardcoded, not configurable). It's now an elapsed-time gate identical in
+ * shape to should_check_health() below, so a user can pick the same
+ * Hourly/Every 6 hours/Twice daily/Daily/Weekly options feed health already
+ * offers.
  */
 class Af_Feed_Advisor_SystemHealthSchedule_Test extends TestCase
 {
-    private Af_Feed_Advisor $plugin;
-    private ReflectionClass $reflection;
+    private function callPrivate(Af_Feed_Advisor $plugin, string $method, array $args = [])
+    {
+        $ref = new ReflectionClass($plugin);
+        $m = $ref->getMethod($method);
+        $m->setAccessible(true);
+        return $m->invokeArgs($plugin, $args);
+    }
 
-    protected function setUp(): void
+    private function pluginWithSystemInterval(int $interval_hours = 24): Af_Feed_Advisor
     {
         $host = $this->createMock(\PluginHost::class);
         $host->method('add_hook')->willReturn(true);
-
-        $this->plugin = new Af_Feed_Advisor();
-        $this->plugin->init($host);
-
-        $this->reflection = new ReflectionClass($this->plugin);
+        $host->method('get')->willReturnCallback(
+            function ($plugin, $key, $default) use ($interval_hours) {
+                if ($key === 'system_check_interval_hours') return $interval_hours;
+                return $default;
+            }
+        );
+        $plugin = new Af_Feed_Advisor();
+        $plugin->init($host);
+        return $plugin;
     }
 
-    // $already_reported_today bypasses the DB dedup lookup (Db::pdo() always
-    // throws in this test bootstrap) so the hour gate can be tested on its
-    // own, deterministically.
-    private function callShouldCheckLogs(int $now, bool $already_reported_today = false): bool
+    private function callShouldCheckLogs(Af_Feed_Advisor $plugin, int $now, int $last_run = 0): bool
     {
-        $m = $this->reflection->getMethod('should_check_logs');
-        $m->setAccessible(true);
-        return (bool)$m->invoke($this->plugin, $now, $already_reported_today);
+        return (bool)$this->callPrivate($plugin, 'should_check_logs', [$now, $last_run]);
     }
 
-    // 2026-07-08 00:00:00 UTC
-    private const MIDNIGHT_UTC = 1783468800;
+    // =========================================================================
+    // GROUP 1: get_system_check_interval_hours()
+    //
+    // Valid values: 1, 6, 12, 24, 168. Default: 24.
+    // =========================================================================
 
-    public function test_runs_at_exactly_midnight_utc(): void
+    public function test_interval_default_when_no_setting(): void
     {
-        $this->assertTrue($this->callShouldCheckLogs(self::MIDNIGHT_UTC));
+        // host->get returns null -> Db throws -> falls back to SYSTEM_CHECK_INTERVAL_HOURS = 24
+        $host = $this->createMock(\PluginHost::class);
+        $host->method('add_hook')->willReturn(true);
+        $plugin = new Af_Feed_Advisor();
+        $plugin->init($host);
+        $this->assertSame(24, $this->callPrivate($plugin, 'get_system_check_interval_hours'));
     }
 
-    public function test_runs_one_second_before_1am_utc(): void
+    /** @dataProvider validIntervalsProvider */
+    public function test_interval_valid_values_are_returned(int $hours): void
     {
-        $this->assertTrue($this->callShouldCheckLogs(self::MIDNIGHT_UTC + 3599));
+        $plugin = $this->pluginWithSystemInterval($hours);
+        $this->assertSame($hours, $this->callPrivate($plugin, 'get_system_check_interval_hours'));
     }
 
-    public function test_skipped_at_1am_utc(): void
+    public function validIntervalsProvider(): array
     {
-        $this->assertFalse($this->callShouldCheckLogs(self::MIDNIGHT_UTC + 3600));
+        return [[1], [6], [12], [24], [168]];
     }
 
-    public function test_skipped_at_former_6am_window(): void
+    /** @dataProvider invalidIntervalsProvider */
+    public function test_interval_invalid_values_fall_back_to_default(int $hours): void
     {
-        $this->assertFalse($this->callShouldCheckLogs(self::MIDNIGHT_UTC + 6 * 3600));
+        $plugin = $this->pluginWithSystemInterval($hours);
+        $this->assertSame(
+            24,
+            $this->callPrivate($plugin, 'get_system_check_interval_hours'),
+            "Invalid interval {$hours} must fall back to 24"
+        );
     }
 
-    public function test_skipped_at_former_6pm_window(): void
+    public function invalidIntervalsProvider(): array
     {
-        $this->assertFalse($this->callShouldCheckLogs(self::MIDNIGHT_UTC + 18 * 3600));
+        return [[0], [2], [5], [7], [13], [48], [100], [167], [169], [999], [-1]];
     }
 
-    public function test_skipped_at_noon_utc(): void
+    // =========================================================================
+    // GROUP 2: should_check_logs()
+    //
+    // Uses elapsed time: returns true when (now - last_run) >= interval.
+    // Base: $now = 1_000_000 seconds since epoch (arbitrary).
+    // =========================================================================
+
+    private const NOW = 1_000_000;
+
+    public function test_check_runs_when_never_previously_run(): void
     {
-        $this->assertFalse($this->callShouldCheckLogs(self::MIDNIGHT_UTC + 12 * 3600));
+        $plugin = $this->pluginWithSystemInterval(24);
+        $this->assertTrue($this->callShouldCheckLogs($plugin, self::NOW, 0));
     }
 
-    public function test_skipped_one_second_before_midnight_utc(): void
+    public function test_check_runs_when_interval_has_elapsed_1h(): void
     {
-        $this->assertFalse($this->callShouldCheckLogs(self::MIDNIGHT_UTC - 1));
+        $last_run = self::NOW - 3600;
+        $plugin   = $this->pluginWithSystemInterval(1);
+        $this->assertTrue($this->callShouldCheckLogs($plugin, self::NOW, $last_run));
     }
 
-    public function test_skipped_at_midnight_when_already_reported_today(): void
+    public function test_check_skipped_when_interval_not_elapsed_1h(): void
     {
-        $this->assertFalse($this->callShouldCheckLogs(self::MIDNIGHT_UTC, true));
+        $last_run = self::NOW - 3599; // one second short
+        $plugin   = $this->pluginWithSystemInterval(1);
+        $this->assertFalse($this->callShouldCheckLogs($plugin, self::NOW, $last_run));
     }
 
-    public function test_runs_at_midnight_when_not_yet_reported_today(): void
+    public function test_check_runs_when_interval_has_elapsed_6h(): void
     {
-        $this->assertTrue($this->callShouldCheckLogs(self::MIDNIGHT_UTC, false));
+        $last_run = self::NOW - 6 * 3600;
+        $plugin   = $this->pluginWithSystemInterval(6);
+        $this->assertTrue($this->callShouldCheckLogs($plugin, self::NOW, $last_run));
     }
 
-    // The already_reported_today bypass is irrelevant outside the midnight
-    // hour - the hour gate must still win.
-    public function test_already_reported_flag_does_not_widen_the_window(): void
+    public function test_check_skipped_when_interval_not_elapsed_6h(): void
     {
-        $this->assertFalse($this->callShouldCheckLogs(self::MIDNIGHT_UTC + 3600, false));
+        $last_run = self::NOW - (6 * 3600 - 1);
+        $plugin   = $this->pluginWithSystemInterval(6);
+        $this->assertFalse($this->callShouldCheckLogs($plugin, self::NOW, $last_run));
+    }
+
+    public function test_check_runs_when_interval_has_elapsed_12h(): void
+    {
+        $last_run = self::NOW - 12 * 3600;
+        $plugin   = $this->pluginWithSystemInterval(12);
+        $this->assertTrue($this->callShouldCheckLogs($plugin, self::NOW, $last_run));
+    }
+
+    public function test_check_skipped_when_interval_not_elapsed_12h(): void
+    {
+        $last_run = self::NOW - (12 * 3600 - 1);
+        $plugin   = $this->pluginWithSystemInterval(12);
+        $this->assertFalse($this->callShouldCheckLogs($plugin, self::NOW, $last_run));
+    }
+
+    public function test_check_runs_when_interval_has_elapsed_24h(): void
+    {
+        $last_run = self::NOW - 24 * 3600;
+        $plugin   = $this->pluginWithSystemInterval(24);
+        $this->assertTrue($this->callShouldCheckLogs($plugin, self::NOW, $last_run));
+    }
+
+    public function test_check_skipped_when_interval_not_elapsed_24h(): void
+    {
+        $last_run = self::NOW - (24 * 3600 - 1);
+        $plugin   = $this->pluginWithSystemInterval(24);
+        $this->assertFalse($this->callShouldCheckLogs($plugin, self::NOW, $last_run));
+    }
+
+    public function test_check_runs_when_interval_has_elapsed_weekly(): void
+    {
+        $last_run = self::NOW - 168 * 3600;
+        $plugin   = $this->pluginWithSystemInterval(168);
+        $this->assertTrue($this->callShouldCheckLogs($plugin, self::NOW, $last_run));
+    }
+
+    public function test_check_skipped_when_interval_not_elapsed_weekly(): void
+    {
+        $last_run = self::NOW - (168 * 3600 - 1);
+        $plugin   = $this->pluginWithSystemInterval(168);
+        $this->assertFalse($this->callShouldCheckLogs($plugin, self::NOW, $last_run));
+    }
+
+    // =========================================================================
+    // GROUP 3: save() - system_check_interval_hours validation and persistence
+    // =========================================================================
+
+    private function runSave(array $post): array
+    {
+        $host = $this->createMock(\PluginHost::class);
+        $host->method('add_hook')->willReturn(true);
+        $captured = [];
+        $host->method('set')->willReturnCallback(
+            function ($plugin, $key, $value) use (&$captured) {
+                $captured[$key] = $value;
+            }
+        );
+        $plugin = new Af_Feed_Advisor();
+        $plugin->init($host);
+
+        $_POST = $post;
+        ob_start();
+        $plugin->save();
+        ob_end_clean();
+        $_POST = [];
+
+        return $captured;
+    }
+
+    /** @dataProvider validIntervalsProvider */
+    public function test_save_stores_valid_interval(int $hours): void
+    {
+        $stored = $this->runSave(['system_check_interval_hours' => (string)$hours]);
+        $this->assertSame($hours, $stored['system_check_interval_hours']);
+    }
+
+    public function test_save_rejects_invalid_interval_and_stores_default(): void
+    {
+        $stored = $this->runSave(['system_check_interval_hours' => '5']);
+        $this->assertSame(24, $stored['system_check_interval_hours'], 'Invalid interval 5 must fall back to 24');
+    }
+
+    public function test_save_uses_default_when_interval_omitted(): void
+    {
+        $stored = $this->runSave([]);
+        $this->assertSame(24, $stored['system_check_interval_hours'], 'Missing interval must default to 24');
     }
 }

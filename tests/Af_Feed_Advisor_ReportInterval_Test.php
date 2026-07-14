@@ -100,9 +100,9 @@ class Af_Feed_Advisor_ReportInterval_Test extends TestCase
 
     public function test_interval_default_when_no_setting(): void
     {
-        // host->get returns null -> Db throws -> falls back to REPORT_INTERVAL_HOURS = 12
+        // host->get returns null -> Db throws -> falls back to REPORT_INTERVAL_HOURS = 24
         $result = $this->callPrivate('get_report_interval_hours');
-        $this->assertSame(12, $result);
+        $this->assertSame(24, $result);
     }
 
     /** @dataProvider validIntervalsProvider */
@@ -127,7 +127,7 @@ class Af_Feed_Advisor_ReportInterval_Test extends TestCase
         $ref    = new ReflectionClass($plugin);
         $m      = $ref->getMethod('get_report_interval_hours');
         $m->setAccessible(true);
-        $this->assertSame(12, $m->invoke($plugin), "Invalid interval {$hours} must fall back to 12");
+        $this->assertSame(24, $m->invoke($plugin), "Invalid interval {$hours} must fall back to 24");
     }
 
     public function invalidIntervalsProvider(): array
@@ -264,24 +264,24 @@ class Af_Feed_Advisor_ReportInterval_Test extends TestCase
     public function test_save_rejects_invalid_interval_and_stores_default(): void
     {
         $stored = $this->runSave(['report_interval_hours' => '5']);
-        $this->assertSame(12, $stored['report_interval_hours'], 'Invalid interval 5 must fall back to 12');
+        $this->assertSame(24, $stored['report_interval_hours'], 'Invalid interval 5 must fall back to 24');
     }
 
     public function test_save_rejects_zero_and_stores_default(): void
     {
         $stored = $this->runSave(['report_interval_hours' => '0']);
-        $this->assertSame(12, $stored['report_interval_hours'], 'Interval 0 must fall back to 12');
+        $this->assertSame(24, $stored['report_interval_hours'], 'Interval 0 must fall back to 24');
     }
 
     public function test_save_rejects_arbitrary_large_value_and_stores_default(): void
     {
         $stored = $this->runSave(['report_interval_hours' => '999']);
-        $this->assertSame(12, $stored['report_interval_hours'], 'Invalid interval 999 must fall back to 12');
+        $this->assertSame(24, $stored['report_interval_hours'], 'Invalid interval 999 must fall back to 24');
     }
 
     public function test_save_uses_default_when_interval_omitted(): void
     {
         $stored = $this->runSave([]);
-        $this->assertSame(12, $stored['report_interval_hours'], 'Missing interval must default to 12');
+        $this->assertSame(24, $stored['report_interval_hours'], 'Missing interval must default to 24');
     }
 }

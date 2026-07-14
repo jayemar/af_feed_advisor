@@ -17,6 +17,7 @@ class PluginHost
     public function add_hook($hook, $plugin, $priority = 10) { return true; }
     public function get($plugin, $key, $default = null) { return $default; }
     public function set($plugin, $key, $value) { return true; }
+    public function get_owner_uid() { return null; }
 }
 
 class Plugin
@@ -33,11 +34,18 @@ class Debug
 }
 
 // Db::pdo() throws so that get_plugin_setting() falls through its catch
-// block and returns the supplied default - no real DB needed.
+// block and returns the supplied default - no real DB needed. Callers that
+// wrap Db::pdo() in their own try/catch (e.g. set_state()'s daemon-context
+// fallback) can't be asserted on via an uncaught exception, so pdo() also
+// tracks how many times it was invoked for tests that need to distinguish
+// "the fallback was attempted" from "the fallback was correctly skipped".
 class Db
 {
+    public static int $pdo_call_count = 0;
+
     public static function pdo()
     {
+        self::$pdo_call_count++;
         throw new \RuntimeException('Database not available in unit tests');
     }
 }
@@ -45,6 +53,11 @@ class Db
 function checkbox_to_sql_bool(string $val): string
 {
     return ($val === 'on' || $val === '1' || $val === 'true') ? 'true' : 'false';
+}
+
+function sql_bool_to_bool(?string $s): bool
+{
+    return $s && ($s !== 'f' && $s !== 'false');
 }
 
 function __($str) { return $str; }
