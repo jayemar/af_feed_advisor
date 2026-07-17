@@ -88,7 +88,8 @@ class Af_Feed_Advisor extends Plugin
     // notification article once created.
     private function ensure_schema() {
         try {
-            $this->pdo->exec("
+            $pdo = Db::pdo();
+            $pdo->exec("
                 CREATE TABLE IF NOT EXISTS ttrss_plugin_feed_advisor_recurring (
                     id SERIAL PRIMARY KEY,
                     owner_uid INTEGER NOT NULL,
@@ -101,10 +102,10 @@ class Af_Feed_Advisor extends Plugin
                     FOREIGN KEY (owner_uid) REFERENCES ttrss_users(id) ON DELETE CASCADE
                 )
             ");
-            $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_feed_advisor_recurring_next_due_at ON ttrss_plugin_feed_advisor_recurring(next_due_at)");
+            $pdo->exec("CREATE INDEX IF NOT EXISTS idx_feed_advisor_recurring_next_due_at ON ttrss_plugin_feed_advisor_recurring(next_due_at)");
 
             Debug::log("Feed Advisor: Database schema initialized successfully");
-        } catch (PDOException $e) {
+        } catch (Exception $e) {
             Debug::log("Feed Advisor: Warning - could not ensure schema: " . $e->getMessage());
         }
     }
