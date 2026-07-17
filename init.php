@@ -39,6 +39,27 @@ class Af_Feed_Advisor extends Plugin
     const REPORT_INTERVAL_HOURS = 24;
     const SYSTEM_CHECK_INTERVAL_HOURS = 24;
 
+    // Synthetic feed this plugin's own articles (health reports, system
+    // advisories, notification articles) are attached to, so they get a
+    // proper name/icon and a place in the feed tree instead of landing in
+    // Archived (feed_id NULL) indistinguishable from real archived articles.
+    const ADVISOR_FEED_URL = 'feed-advisor:local';
+
+    // Rhesus runs as its own container on its own port (see docker-compose.yaml's
+    // rhesus-server service) rather than under the same host/path as TT-RSS
+    // itself, so a deep link into it has to assume this port rather than being
+    // derivable from the current request.
+    const RHESUS_PORT = 3001;
+
+    // Builds a link into Rhesus's article view for a given feed, using the
+    // current request's hostname (works whether accessed by IP, localhost, or
+    // a real domain) with Rhesus's own port substituted in.
+    private function rhesus_feed_url($feed_id) {
+        $host = preg_replace('/:\d+$/', '', $_SERVER['HTTP_HOST'] ?? 'localhost');
+        $proto = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        return "{$proto}://{$host}:" . self::RHESUS_PORT . "/feed/{$feed_id}";
+    }
+
     function about()
     {
         return array(
@@ -861,7 +882,7 @@ class Af_Feed_Advisor extends Plugin
         $stale_days = $this->get_stale_days();
 
         $sth = $pdo->prepare("
-            SELECT id, title, feed_url, last_error, last_updated,
+            SELECT id, title, feed_url, site_url, last_error, last_updated,
                    last_successful_update, owner_uid
             FROM ttrss_feeds
             WHERE last_error != ''
@@ -874,7 +895,7 @@ class Af_Feed_Advisor extends Plugin
         $broken_feeds = $sth->fetchAll(PDO::FETCH_ASSOC);
 
         $sth = $pdo->prepare("
-            SELECT f.id, f.title, f.feed_url, f.owner_uid,
+            SELECT f.id, f.title, f.feed_url, f.site_url, f.owner_uid,
                    MAX(e.updated) AS last_article_date
             FROM ttrss_feeds f
             JOIN ttrss_user_entries ue ON ue.feed_id = f.id
@@ -882,7 +903,8 @@ class Af_Feed_Advisor extends Plugin
             WHERE (f.last_error = '' OR f.last_error IS NULL)
               AND f.owner_uid = ?
               AND f.feed_url NOT LIKE 'share-anything:%'
-            GROUP BY f.id, f.title, f.feed_url, f.owner_uid
+              AND f.feed_url != '" . self::ADVISOR_FEED_URL . "'
+            GROUP BY f.id, f.title, f.feed_url, f.site_url, f.owner_uid
             HAVING MAX(e.updated) < NOW() - INTERVAL '{$stale_days} days'
             ORDER BY MAX(e.updated) ASC
         ");
@@ -895,6 +917,55 @@ class Af_Feed_Advisor extends Plugin
         $stale_count = count($stale_feeds);
         Debug::log("Feed Advisor: Health check complete for uid={$owner_uid}, {$broken_count} broken, {$stale_count} stale.");
         return $broken_count + $stale_count;
+    }
+
+    // Returns the id of this user's "Feed Advisor" synthetic feed, creating
+    // it (with a custom icon, and updates disabled since feed_url isn't a
+    // real HTTP source) on first use.
+    private function get_or_create_advisor_feed_id(int $owner_uid): int
+    {
+        $pdo = Db::pdo();
+
+        $sth = $pdo->prepare("SELECT id FROM ttrss_feeds WHERE owner_uid = ? AND feed_url = ?");
+        $sth->execute([$owner_uid, self::ADVISOR_FEED_URL]);
+        $feed_id = $sth->fetchColumn();
+
+        if ($feed_id) {
+            return (int)$feed_id;
+        }
+
+        $sth = $pdo->prepare("
+            INSERT INTO ttrss_feeds (owner_uid, title, feed_url, update_interval, cat_id)
+            VALUES (?, 'Feed Advisor', ?, -1, NULL)
+            RETURNING id
+        ");
+        $sth->execute([$owner_uid, self::ADVISOR_FEED_URL]);
+        $feed_id = (int)$sth->fetchColumn();
+
+        $this->set_advisor_feed_icon($feed_id);
+
+        return $feed_id;
+    }
+
+    private function set_advisor_feed_icon(int $feed_id): void
+    {
+        try {
+            $icon_path = __DIR__ . '/feed-icon.png';
+            if (!is_file($icon_path)) return;
+
+            $content = file_get_contents($icon_path);
+            if ($content === false) return;
+
+            DiskCache::instance('feed-icons')->put((string)$feed_id, $content);
+
+            $feed = ORM::for_table('ttrss_feeds')->find_one($feed_id);
+            if ($feed) {
+                $feed->set(['favicon_avg_color' => null, 'favicon_is_custom' => true]);
+                $feed->save();
+            }
+        } catch (Exception $e) {
+            Debug::log("Feed Advisor: Failed to set advisor feed icon: " . $e->getMessage());
+        }
     }
 
     private function create_consolidated_health_advisory(array $broken_feeds, array $stale_feeds, int $owner_uid, bool $force = false): void
@@ -934,7 +1005,7 @@ class Af_Feed_Advisor extends Plugin
             $content .= "<p>{$broken_count} feed" . ($broken_count !== 1 ? 's have' : ' has') .
                         " been failing for more than {$broken_days} days.</p>";
             $content .= "<table>";
-            $content .= "<tr><th>Feed</th><th>Error Type</th><th>Last Success</th><th>Broken For</th><th>Suggestion</th></tr>";
+            $content .= "<tr><th>Feed</th><th>Error Type</th><th>Last Success</th><th>Broken For</th><th>Suggestion</th><th>Links</th></tr>";
 
             foreach ($broken_feeds as $feed) {
                 $error_info = $this->categorize_feed_error($feed['last_error']);
@@ -952,12 +1023,17 @@ class Af_Feed_Advisor extends Plugin
 
                 $feed_link = "<a href=\"" . htmlspecialchars($feed['feed_url']) . "\" target=\"_blank\" rel=\"noopener\">" .
                              htmlspecialchars($feed['title']) . "</a>";
+                $links = "<a href=\"" . htmlspecialchars($this->rhesus_feed_url($feed['id'])) . "\" target=\"_blank\" rel=\"noopener\">Rhesus</a>";
+                if (!empty($feed['site_url'])) {
+                    $links .= " &middot; <a href=\"" . htmlspecialchars($feed['site_url']) . "\" target=\"_blank\" rel=\"noopener\">Site</a>";
+                }
                 $content .= "<tr>";
                 $content .= "<td>{$feed_link}</td>";
                 $content .= "<td>{$error_info['label']}</td>";
                 $content .= "<td>{$last_success_str}</td>";
                 $content .= "<td>{$days_str}</td>";
                 $content .= "<td>{$error_info['suggestion']}</td>";
+                $content .= "<td>{$links}</td>";
                 $content .= "</tr>";
             }
 
@@ -972,7 +1048,7 @@ class Af_Feed_Advisor extends Plugin
             $content .= "<p>{$stale_count} feed" . ($stale_count !== 1 ? 's have' : ' has') .
                         " not published a new article in more than {$stale_days} days.</p>";
             $content .= "<table>";
-            $content .= "<tr><th>Feed</th><th>Last Article</th><th>Days Silent</th></tr>";
+            $content .= "<tr><th>Feed</th><th>Last Article</th><th>Days Silent</th><th>Links</th></tr>";
 
             foreach ($stale_feeds as $feed) {
                 $last_date = $feed['last_article_date'];
@@ -981,10 +1057,15 @@ class Af_Feed_Advisor extends Plugin
 
                 $feed_link = "<a href=\"" . htmlspecialchars($feed['feed_url']) . "\" target=\"_blank\" rel=\"noopener\">" .
                              htmlspecialchars($feed['title']) . "</a>";
+                $links = "<a href=\"" . htmlspecialchars($this->rhesus_feed_url($feed['id'])) . "\" target=\"_blank\" rel=\"noopener\">Rhesus</a>";
+                if (!empty($feed['site_url'])) {
+                    $links .= " &middot; <a href=\"" . htmlspecialchars($feed['site_url']) . "\" target=\"_blank\" rel=\"noopener\">Site</a>";
+                }
                 $content .= "<tr>";
                 $content .= "<td>{$feed_link}</td>";
                 $content .= "<td>{$last_date}</td>";
                 $content .= "<td>{$days_silent}d</td>";
+                $content .= "<td>{$links}</td>";
                 $content .= "</tr>";
             }
 
@@ -1014,13 +1095,15 @@ class Af_Feed_Advisor extends Plugin
                 return;
             }
 
+            $feed_id = $this->get_or_create_advisor_feed_id($owner_uid);
+
             $sth = $pdo->prepare("
                 INSERT INTO ttrss_user_entries
                     (ref_id, feed_id, owner_uid, unread, marked, published, uuid, tag_cache, label_cache)
-                VALUES (?, NULL, ?, true, false, false, '', '', '')
+                VALUES (?, ?, ?, true, false, false, '', '', '')
                 ON CONFLICT DO NOTHING
             ");
-            $sth->execute([$entry_id, $owner_uid]);
+            $sth->execute([$entry_id, $feed_id, $owner_uid]);
 
             if ($broken_count > 0 || $stale_count > 0) {
                 $label_id = $this->get_or_create_health_label($owner_uid);
@@ -1349,12 +1432,14 @@ class Af_Feed_Advisor extends Plugin
             }
 
             // Link to user entries (owner_uid = 1)
+            $feed_id = $this->get_or_create_advisor_feed_id(1);
+
             $sth = $pdo->prepare('
                 INSERT INTO ttrss_user_entries (ref_id, feed_id, owner_uid, unread, marked, published, uuid, tag_cache, label_cache)
-                VALUES (?, NULL, 1, true, false, false, \'\', \'\', \'{"no-labels":1}\')
+                VALUES (?, ?, 1, true, false, false, \'\', \'\', \'{"no-labels":1}\')
                 ON CONFLICT DO NOTHING
             ');
-            $sth->execute([$entry_id]);
+            $sth->execute([$entry_id, $feed_id]);
 
             Debug::log("Feed Advisor: Created system health advisory with {$total_issues} issues");
         } catch (Exception $e) {
@@ -1431,6 +1516,7 @@ class Af_Feed_Advisor extends Plugin
                 JOIN ttrss_entries e ON e.id = ue.ref_id
                 WHERE (f.last_error = '' OR f.last_error IS NULL)
                   AND f.feed_url NOT LIKE 'share-anything:%'
+              AND f.feed_url != '" . self::ADVISOR_FEED_URL . "'
                 GROUP BY f.id
                 HAVING MAX(e.updated) < NOW() - INTERVAL '{$stale_days} days'
             ) stale
@@ -1525,6 +1611,26 @@ class Af_Feed_Advisor extends Plugin
 
         print "</form>";
 
+        // Notification article: inserts a standalone article at an arbitrary
+        // date/time, independent of this form's persisted settings, so it
+        // lives outside the <form> above (own button, own handler - see
+        // createNotificationArticle() below and its JS counterpart in
+        // get_prefs_js()).
+        print "<h2>" . __("Notification Article") . "</h2>";
+        print "<p>" . __("Creates an article under the Feed Advisor feed that sorts into your article list at the date/time you choose below - the article's own displayed date is always when you actually click Create, not the insertion time.") . "</p>";
+        print "<table>";
+        print "<tr><td width='40%'>" . __("Title") . "</td>";
+        print "<td><input type='text' id='af-advisor-notif-title' style='width:100%;box-sizing:border-box'></td></tr>";
+        print "<tr><td width='40%' style='vertical-align:top'>" . __("Content") . "</td>";
+        print "<td><textarea id='af-advisor-notif-content' rows='4' style='width:100%;box-sizing:border-box'></textarea></td></tr>";
+        print "<tr><td width='40%'>" . __("Insert at") . "</td>";
+        print "<td><input type='datetime-local' id='af-advisor-notif-datetime'>" .
+            "<div style='font-size:11px;opacity:0.7;margin-top:2px'>" . __("Your local time zone - converted automatically.") . "</div></td></tr>";
+        print "</table>";
+        print "<style>#af-advisor-notif-create .dijitButtonNode { background: #1a73e8 !important; border-color: #1165c4 !important; } #af-advisor-notif-create .dijitButtonText { color: #fff !important; }</style>";
+        print "<p id='af-advisor-notif-create'><button dojoType='dijit.form.Button' onclick='return Plugins.Af_Feed_Advisor.createNotificationArticle()'>" .
+            __("Create Notification Article") . "</button></p>";
+
         // Bulk operations
         print "<h2>Bulk Operations</h2>";
         print "<p>";
@@ -1576,6 +1682,20 @@ class Af_Feed_Advisor extends Plugin
     {
         return "if (!Plugins.Af_Feed_Advisor) Plugins.Af_Feed_Advisor = {};
 
+        // Prefill 'Insert at' with the current moment in the browser's own
+        // local time zone - a server-rendered default would be in the
+        // server's time zone instead, which is misleading given the field
+        // is otherwise entirely local-time (see createNotificationArticle()).
+        (function() {
+            var el = document.getElementById('af-advisor-notif-datetime');
+            if (el && !el.value) {
+                var now = new Date();
+                var pad = function(n) { return String(n).padStart(2, '0'); };
+                el.value = now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate()) +
+                    'T' + pad(now.getHours()) + ':' + pad(now.getMinutes());
+            }
+        })();
+
         Plugins.Af_Feed_Advisor.bulkAnalyze = function() {
             Notify.progress('Analyzing all feeds...', true);
             xhr.json('backend.php', {op: 'PluginHandler', plugin: 'af_feed_advisor', method: 'bulkAnalyze'})
@@ -1616,6 +1736,55 @@ class Af_Feed_Advisor extends Plugin
             Notify.progress('Checking system logs...', true);
             xhr.json('backend.php', {op: 'PluginHandler', plugin: 'af_feed_advisor', method: 'checkSystemHealthNow'})
                 .then(function(r) { Notify.info('System health report created (' + (r.issues_found ? 'issues found' : 'all clear') + ').'); });
+            return false;
+        };
+
+        Plugins.Af_Feed_Advisor.createNotificationArticle = function() {
+            var title = document.getElementById('af-advisor-notif-title').value;
+            var content = document.getElementById('af-advisor-notif-content').value;
+            var insertAtLocal = document.getElementById('af-advisor-notif-datetime').value;
+
+            if (!title.trim()) {
+                Notify.error('Title is required.');
+                return false;
+            }
+            if (!insertAtLocal) {
+                Notify.error('Insertion date/time is required.');
+                return false;
+            }
+
+            // The datetime-local input's value has no timezone attached - the
+            // browser edits/displays it in the user's own local time zone, so
+            // that's how the Date constructor parses this exact string shape
+            // (unlike PHP's strtotime(), which would otherwise interpret it
+            // using the server's timezone). Converting to an ISO string here
+            // (with its 'Z' suffix) makes the instant unambiguous by the time
+            // it reaches the server.
+            var insertAtDate = new Date(insertAtLocal);
+            if (isNaN(insertAtDate.getTime())) {
+                Notify.error('Invalid date/time.');
+                return false;
+            }
+            var insertAtUtc = insertAtDate.toISOString();
+
+            Notify.progress('Creating article...', true);
+            xhr.json('backend.php', {op: 'PluginHandler', plugin: 'af_feed_advisor', method: 'createNotificationArticle',
+                title: title, content: content, insert_at: insertAtUtc})
+                .then(function(r) {
+                    if (r.error) {
+                        Notify.error(r.error);
+                    } else {
+                        Notify.info('Notification article created.');
+                        document.getElementById('af-advisor-notif-title').value = '';
+                        document.getElementById('af-advisor-notif-content').value = '';
+                        // Rhesus doesn't auto-poll, and its pull-to-refresh gesture
+                        // appends new articles without re-sorting them into place -
+                        // a manual refresh (switching feeds/views, or reopening the
+                        // article list) is what actually re-applies sort order.
+                        var when = insertAtDate.toLocaleString();
+                        alert('\"' + title + '\" article created for ' + when + '\\n\\nYou may need to refresh your article list for the new article to properly be included.');
+                    }
+                });
             return false;
         };";
     }
@@ -1691,6 +1860,76 @@ class Af_Feed_Advisor extends Plugin
         $issues_found = $this->check_system_logs(true);
         header('Content-Type: application/json');
         echo json_encode(['issues_found' => $issues_found]);
+    }
+
+    /**
+     * AJAX handler: Creates a standalone article (same feed-less/"Archived"
+     * shape as the health report articles below) whose date_entered - the
+     * column TT-RSS actually sorts headlines by - is the user-chosen
+     * insertion time, which may be in the past or future. `updated`/
+     * `date_updated` are always NOW(), so the article's own displayed date
+     * is when it was really created, independent of where it sorts.
+     */
+    function createNotificationArticle()
+    {
+        header('Content-Type: application/json');
+
+        $title = trim(strip_tags($_POST['title'] ?? ''));
+        $content_raw = trim($_POST['content'] ?? '');
+        $insert_at = trim($_POST['insert_at'] ?? '');
+
+        if ($title === '') {
+            echo json_encode(['error' => 'Title is required.']);
+            return;
+        }
+
+        $insert_ts = $insert_at !== '' ? strtotime($insert_at) : false;
+        if ($insert_ts === false) {
+            echo json_encode(['error' => 'Invalid date/time.']);
+            return;
+        }
+
+        $owner_uid = (int)$_SESSION['uid'];
+        $pdo = Db::pdo();
+
+        // Plain-text textarea input, not trusted HTML - escape then restore
+        // line breaks, rather than storing the raw value as article content.
+        $content_html = nl2br(htmlspecialchars($content_raw));
+        $date_entered = date('Y-m-d H:i:s', $insert_ts);
+        $guid = 'feed-advisor:notification:' . uniqid('', true) . '-uid' . $owner_uid;
+        $content_hash = 'SHA1:' . sha1($content_html);
+
+        try {
+            $sth = $pdo->prepare("
+                INSERT INTO ttrss_entries
+                    (title, guid, link, content, content_hash, updated, date_entered, date_updated)
+                VALUES (?, ?, '', ?, ?, NOW(), ?, NOW())
+                ON CONFLICT (guid) DO NOTHING
+                RETURNING id
+            ");
+            $sth->execute([$title, $guid, $content_html, $content_hash, $date_entered]);
+            $entry_id = $sth->fetchColumn();
+
+            if (!$entry_id) {
+                echo json_encode(['error' => 'Could not create article (duplicate guid, please retry).']);
+                return;
+            }
+
+            $feed_id = $this->get_or_create_advisor_feed_id($owner_uid);
+
+            $sth = $pdo->prepare("
+                INSERT INTO ttrss_user_entries
+                    (ref_id, feed_id, owner_uid, unread, marked, published, uuid, tag_cache, label_cache)
+                VALUES (?, ?, ?, true, false, false, '', '', '')
+            ");
+            $sth->execute([$entry_id, $feed_id, $owner_uid]);
+
+            Debug::log("Feed Advisor: Created notification article '{$title}' (id={$entry_id}) for uid={$owner_uid}, inserted at {$date_entered}.");
+            echo json_encode(['success' => true, 'id' => $entry_id]);
+        } catch (Exception $e) {
+            Debug::log("Feed Advisor: Failed to create notification article: " . $e->getMessage());
+            echo json_encode(['error' => 'Failed to create article.']);
+        }
     }
 
     /**

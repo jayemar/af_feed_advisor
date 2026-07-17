@@ -11,9 +11,16 @@ directly in your TT-RSS instance.
   not match their content, and recommends or auto-applies corrections
 - **System log monitoring** - reads Docker logs on a configurable schedule and surfaces
   errors, warnings, and exceptions as advisory articles
+- **Notification articles** - manually create an article that sorts into your article
+  list at a date/time you choose, past or future, with your own title and message
 - **Bulk operations** - analyze all feeds at once and apply all pending recommendations
   in one action
 - **Per-user isolation** - each user's health reports only reflect their own feeds
+
+All articles this plugin creates that aren't tied to a specific feed (health reports,
+system log advisories, notification articles) appear under a synthetic **Feed Advisor**
+feed, created automatically the first time any of them fires. It has updates disabled
+(it isn't backed by a real URL) and its own icon.
 
 ## Installation
 
@@ -60,20 +67,25 @@ compares the elapsed time against the configured interval - it only acts when en
 has passed.
 
 When the check runs, it queries every user's feeds and creates one consolidated report
-article per user. The article appears in **All articles** and **Unread** views with the
-`feed-health` label applied.
+article per user, under the **Feed Advisor** feed (see above), with the `feed-health`
+label applied.
 
 ### Broken feeds
 
 A feed is reported as broken if `last_error` is non-empty and the last successful update
 was more than the configured threshold ago (default: 7 days). The report includes the
-error type, last successful update date, and a remediation suggestion for each feed.
+error type, last successful update date, a remediation suggestion, and a Links column
+for each feed - a link into Rhesus's article view for that feed (assumes Rhesus is
+reachable on its own port, `RHESUS_PORT` in `init.php`, currently 3001), plus a link to
+the feed's site URL when one is known, useful for checking whether the site itself is
+still alive.
 
 ### Stale feeds
 
 A feed is reported as stale if it has no parse error but has not published a new article
 within the configured threshold (default: 365 days). Feeds with URLs starting with
-`share-anything:` are excluded.
+`share-anything:`, and the plugin's own synthetic **Feed Advisor** feed, are excluded.
+Same Links column as the broken feeds table (Rhesus + site URL).
 
 ### Manual check
 
@@ -138,6 +150,31 @@ creates one regardless.
 
 The plugin skips system log monitoring silently if the log file does not exist.
 
+## Notification Articles
+
+**Preferences - Feeds - Feed Advisor - Notification Article**
+
+Creates a standalone article under the **Feed Advisor** feed with a title, optional
+message, and a date/time you choose:
+
+| Field | Description |
+|---|---|
+| Title | Required |
+| Content | Optional plain text - stored escaped, with line breaks preserved. Not interpreted as HTML |
+| Insert at | Date/time the article sorts to in your article list, past or future. Entered and interpreted in **your browser's local time zone** - converted to UTC client-side before it's sent, so it doesn't depend on the server's time zone |
+
+The key distinction is between *where the article sorts* and *when it was actually
+created*:
+
+- `date_entered` - the column TT-RSS's default headline ordering actually sorts by - is
+  set to the "Insert at" value, so the article appears exactly where you placed it,
+  even if that's in the past or the future relative to when you created it.
+- `updated` (the article's own displayed date) is always the real creation time, i.e.
+  when you clicked "Create Notification Article" - never the insertion time.
+
+The article is created unread, with no category, under the Feed Advisor feed like any
+other article this plugin generates.
+
 ## Article GUIDs
 
 | Report type | GUID format |
@@ -145,6 +182,7 @@ The plugin skips system log monitoring silently if the log file does not exist.
 | Scheduled health report | `feed-advisor:health-report:YYYY-MM-DD-HH-ii-ss-uidN` |
 | Manual health report | same format, different timestamp |
 | System log advisory | `feed-advisor:system-health:YYYY-MM-DD-HH-ii-ss` |
+| Notification article | `feed-advisor:notification:<uniqid>-uidN` |
 | Enclosure advisory | stored in plugin state, not a standalone entry |
 
 ## Troubleshooting
@@ -154,6 +192,11 @@ The plugin skips system log monitoring silently if the log file does not exist.
 The article is created immediately in the database but Rhesus does not auto-poll.
 Navigate away from the preferences pane and back to an article view, or pull down
 at the bottom of the article list to fetch new articles.
+
+**"Feed Advisor" feed doesn't show up in the feed tree yet**
+
+It's created lazily on first use, not on plugin install. Run a health check, wait for a
+scheduled report, or create a notification article, and it will appear.
 
 **Health report shows feeds belonging to other users**
 
