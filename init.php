@@ -72,11 +72,41 @@ class Af_Feed_Advisor extends Plugin
     function init($host)
     {
         $this->host = $host;
+        $this->ensure_schema();
 
         // Register hooks
         $host->add_hook($host::HOOK_ARTICLE_FILTER, $this);
         $host->add_hook($host::HOOK_PREFS_TAB, $this);
         $host->add_hook($host::HOOK_HOUSE_KEEPING, $this);
+    }
+
+    // Recurring notification-article schedules, processed on each
+    // housekeeping pass (see process_recurring_notifications()). Separate
+    // from the one-time notification articles created immediately by
+    // createNotificationArticle() - this table only tracks the *schedule*,
+    // not the articles themselves, which are ordinary entries like any other
+    // notification article once created.
+    private function ensure_schema() {
+        try {
+            $this->pdo->exec("
+                CREATE TABLE IF NOT EXISTS ttrss_plugin_feed_advisor_recurring (
+                    id SERIAL PRIMARY KEY,
+                    owner_uid INTEGER NOT NULL,
+                    title VARCHAR(255) NOT NULL,
+                    content TEXT,
+                    interval_quantity INTEGER NOT NULL,
+                    interval_unit VARCHAR(10) NOT NULL,
+                    next_due_at TIMESTAMP NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (owner_uid) REFERENCES ttrss_users(id) ON DELETE CASCADE
+                )
+            ");
+            $this->pdo->exec("CREATE INDEX IF NOT EXISTS idx_feed_advisor_recurring_next_due_at ON ttrss_plugin_feed_advisor_recurring(next_due_at)");
+
+            Debug::log("Feed Advisor: Database schema initialized successfully");
+        } catch (PDOException $e) {
+            Debug::log("Feed Advisor: Warning - could not ensure schema: " . $e->getMessage());
+        }
     }
 
     function get_generated_feeds($feed_id = null)
@@ -126,6 +156,11 @@ class Af_Feed_Advisor extends Plugin
                 }
             }
         }
+
+        // Independent of the "Enable feed analysis" toggle above - a
+        // recurring notification is something the user explicitly set up,
+        // not part of the enclosure-analysis feature that setting governs.
+        $this->process_recurring_notifications();
     }
 
     /**
@@ -968,6 +1003,38 @@ class Af_Feed_Advisor extends Plugin
         }
     }
 
+    // Lists the current user's active recurring notification schedules, with
+    // a Stop button per row - rendered directly into the prefs tab, same
+    // pattern as the "Recent Advisories" table elsewhere in this file.
+    private function render_recurring_notifications_list(int $owner_uid): void {
+        $sth = Db::pdo()->prepare("
+            SELECT id, title, interval_quantity, interval_unit, next_due_at
+            FROM ttrss_plugin_feed_advisor_recurring
+            WHERE owner_uid = ?
+            ORDER BY next_due_at ASC
+        ");
+        $sth->execute([$owner_uid]);
+        $rows = $sth->fetchAll();
+
+        if (!$rows) return;
+
+        print "<h3 style='margin-top:16px'>" . __("Recurring Notifications") . "</h3>";
+        print "<table class='prefPluginsList'>";
+        print "<tr><th>" . __("Title") . "</th><th>" . __("Repeats") . "</th><th>" . __("Next Due") . "</th><th>" . __("Actions") . "</th></tr>";
+
+        foreach ($rows as $row) {
+            print "<tr>";
+            print "<td>" . htmlspecialchars($row['title']) . "</td>";
+            print "<td>" . __("Every") . " {$row['interval_quantity']} " . htmlspecialchars($row['interval_unit']) . "</td>";
+            print "<td>" . htmlspecialchars($row['next_due_at']) . "</td>";
+            print "<td><button dojoType='dijit.form.Button' onclick='return Plugins.Af_Feed_Advisor.stopRecurringNotification({$row['id']})'>" .
+                __("Stop") . "</button></td>";
+            print "</tr>";
+        }
+
+        print "</table>";
+    }
+
     private function create_consolidated_health_advisory(array $broken_feeds, array $stale_feeds, int $owner_uid, bool $force = false): void
     {
         $broken_count = count($broken_feeds);
@@ -1209,7 +1276,10 @@ class Af_Feed_Advisor extends Plugin
     {
         // Parse Docker logs from the last 24 hours
         $issues = $this->parse_docker_logs();
-        $issues_found = !empty($issues['errors']) || !empty($issues['warnings']) || !empty($issues['exceptions']);
+        // Only application errors/warnings count as "issues" for the
+        // quiet-when-clean gate - routine feed/media fetch noise doesn't,
+        // or the checkbox would never actually stay quiet.
+        $issues_found = !empty($issues['exceptions']) || !empty($issues['app_errors']) || !empty($issues['infra_warnings']);
 
         if ($force || $issues_found || !$this->is_system_quiet_when_clean_enabled()) {
             $this->create_system_advisory($issues);
@@ -1224,14 +1294,69 @@ class Af_Feed_Advisor extends Plugin
     }
 
     /**
-     * Parse Docker logs for warnings, errors, and exceptions
+     * Lines that match ERROR/WARNING purely by keyword but carry no
+     * actionable signal for a human reader - routine housekeeping and
+     * plugin debug logging, not real problems.
+     */
+    private function is_ignorable_log_line(string $line): bool
+    {
+        static $ignore_patterns = array(
+            '/Removing old error log entries/',
+            '/AF_ENHANCE_CONTENT: hook_article_filter\(\) called for/',
+            '/AF_ENHANCE_CONTENT: Matching enclosure/',
+        );
+        foreach ($ignore_patterns as $pattern) {
+            if (preg_match($pattern, $line)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Best-effort extraction of the URL a fetch-failure log line refers to,
+     * so media-caching noise can be grouped by source domain instead of by
+     * (mostly unique) full URL.
+     */
+    private function extract_url_from_line(string $line): ?string
+    {
+        if (preg_match('/`GET ([^`]+)`/', $line, $m)) {
+            return $m[1];
+        }
+        if (preg_match('/for (https?:\/\/\S+?)(?:\.\.\.)?\s*$/', $line, $m)) {
+            return rtrim($m[1], '.');
+        }
+        return null;
+    }
+
+    /**
+     * Parse Docker logs for warnings, errors, and exceptions.
+     *
+     * Buckets lines by what a human actually needs to act on, rather than
+     * lumping everything containing the word "error" into one firehose:
+     * - exceptions/app_errors: real application-level bugs (SQLSTATE, PHP
+     *   Exceptions) - shown in full detail, highest priority.
+     * - infra_warnings: PHP/server operational warnings (e.g. pm.max_children)
+     *   - shown in full detail.
+     * - feed fetch failures (TT-RSS's own "!! Last error:" lines): usually
+     *   dead/blocked feeds already tracked in more detail by the separate
+     *   Feed Health report - collapsed to a category breakdown, not
+     *   enumerated per-occurrence.
+     * - media/enclosure caching failures (cache_media/cache_enclosures):
+     *   external image/asset link rot, essentially never actionable on our
+     *   end - collapsed to a total count plus top offending domains.
      */
     private function parse_docker_logs()
     {
         $issues = array(
-            'errors' => array(),
-            'warnings' => array(),
-            'exceptions' => array()
+            'exceptions' => array(),
+            'app_errors' => array(),
+            'infra_warnings' => array(),
+            'feed_fetch_total' => 0,
+            'feed_fetch_categories' => array(),
+            'feed_fetch_urls' => array(),
+            'media_cache_total' => 0,
+            'media_cache_domains' => array(),
         );
 
         try {
@@ -1264,9 +1389,9 @@ class Af_Feed_Advisor extends Plugin
                 return $issues;
             }
 
-            $error_counts = array();
-            $warning_counts = array();
             $exception_counts = array();
+            $app_error_counts = array();
+            $infra_warning_counts = array();
 
             foreach ($output as $line) {
                 // Skip empty lines
@@ -1274,33 +1399,61 @@ class Af_Feed_Advisor extends Plugin
                     continue;
                 }
 
+                if ($this->is_ignorable_log_line($line)) {
+                    continue;
+                }
+
                 // Match exceptions
                 if (preg_match('/Exception: (.+)/', $line, $matches)) {
                     $error_msg = trim($matches[1]);
-                    if (!isset($exception_counts[$error_msg])) {
-                        $exception_counts[$error_msg] = 0;
-                    }
-                    $exception_counts[$error_msg]++;
+                    $exception_counts[$error_msg] = ($exception_counts[$error_msg] ?? 0) + 1;
+                    continue;
                 }
-                // Match errors (case insensitive)
-                elseif (preg_match('/\b(ERROR|SQLSTATE)\b/i', $line)) {
-                    // Extract meaningful error message
+
+                // Media/enclosure caching noise - checked before the generic
+                // ERROR match below, since these lines also contain "error"
+                // (e.g. "cache_media: failed with 404: Client error: ...").
+                if (preg_match('/cache_media:|cache_enclosures:/', $line)) {
+                    $issues['media_cache_total']++;
+                    $url = $this->extract_url_from_line($line);
+                    $domain = $url ? parse_url($url, PHP_URL_HOST) : null;
+                    if ($domain) {
+                        $issues['media_cache_domains'][$domain] = ($issues['media_cache_domains'][$domain] ?? 0) + 1;
+                    }
+                    continue;
+                }
+
+                // Feed fetch failures - TT-RSS's own persisted last_error log
+                // line. Also checked before the generic ERROR match, and
+                // reuses the same categorize_feed_error() the Feed Health
+                // report uses, so both reports describe failures the same way.
+                if (preg_match('/!! Last error:/', $line)) {
+                    $issues['feed_fetch_total']++;
+                    $category = $this->categorize_feed_error($line);
+                    $label = $category['label'];
+                    $issues['feed_fetch_categories'][$label] = ($issues['feed_fetch_categories'][$label] ?? 0) + 1;
+                    $url = $this->extract_url_from_line($line);
+                    if ($url) {
+                        $issues['feed_fetch_urls'][$url] = true;
+                    }
+                    continue;
+                }
+
+                // Match errors (case insensitive) - whatever's left is a
+                // genuine application-level error worth surfacing in full.
+                if (preg_match('/\b(ERROR|SQLSTATE)\b/i', $line)) {
                     $error_msg = $this->extract_error_message($line);
-                    if ($error_msg && !isset($error_counts[$error_msg])) {
-                        $error_counts[$error_msg] = 0;
-                    }
                     if ($error_msg) {
-                        $error_counts[$error_msg]++;
+                        $app_error_counts[$error_msg] = ($app_error_counts[$error_msg] ?? 0) + 1;
                     }
+                    continue;
                 }
+
                 // Match warnings
-                elseif (preg_match('/\b(WARNING|Warning|warning)\b/', $line)) {
+                if (preg_match('/\b(WARNING|Warning|warning)\b/', $line)) {
                     $warning_msg = $this->extract_error_message($line);
-                    if ($warning_msg && !isset($warning_counts[$warning_msg])) {
-                        $warning_counts[$warning_msg] = 0;
-                    }
                     if ($warning_msg) {
-                        $warning_counts[$warning_msg]++;
+                        $infra_warning_counts[$warning_msg] = ($infra_warning_counts[$warning_msg] ?? 0) + 1;
                     }
                 }
             }
@@ -1309,17 +1462,19 @@ class Af_Feed_Advisor extends Plugin
             foreach ($exception_counts as $msg => $count) {
                 $issues['exceptions'][] = array('message' => $msg, 'count' => $count);
             }
-            foreach ($error_counts as $msg => $count) {
-                $issues['errors'][] = array('message' => $msg, 'count' => $count);
+            foreach ($app_error_counts as $msg => $count) {
+                $issues['app_errors'][] = array('message' => $msg, 'count' => $count);
             }
-            foreach ($warning_counts as $msg => $count) {
-                $issues['warnings'][] = array('message' => $msg, 'count' => $count);
+            foreach ($infra_warning_counts as $msg => $count) {
+                $issues['infra_warnings'][] = array('message' => $msg, 'count' => $count);
             }
 
             // Sort by count (descending)
             usort($issues['exceptions'], function($a, $b) { return $b['count'] - $a['count']; });
-            usort($issues['errors'], function($a, $b) { return $b['count'] - $a['count']; });
-            usort($issues['warnings'], function($a, $b) { return $b['count'] - $a['count']; });
+            usort($issues['app_errors'], function($a, $b) { return $b['count'] - $a['count']; });
+            usort($issues['infra_warnings'], function($a, $b) { return $b['count'] - $a['count']; });
+            arsort($issues['feed_fetch_categories']);
+            arsort($issues['media_cache_domains']);
 
         } catch (Exception $e) {
             // Log parsing failed, return empty
@@ -1359,13 +1514,18 @@ class Af_Feed_Advisor extends Plugin
         $content = "<div class='feed-advisor-article'>";
         $content .= "<h2>System Health Report</h2>";
         $content .= "<p><strong>Generated:</strong> {$timestamp}</p>";
-        $content .= "<p>This report summarizes errors, warnings, and exceptions from the last 24 hours.</p>";
+        $content .= "<p>This report summarizes application errors and operational warnings from the last 24 hours. Routine feed/media fetch noise is summarized separately below rather than listed line-by-line.</p>";
 
-        $total_issues = count($issues['exceptions']) + count($issues['errors']) + count($issues['warnings']);
+        $actionable_count = count($issues['exceptions']) + count($issues['app_errors']) + count($issues['infra_warnings']);
+        $total_issues = $actionable_count + $issues['feed_fetch_total'] + $issues['media_cache_total'];
 
         if ($total_issues === 0) {
             $content .= "<p><strong>✓ No issues detected</strong></p>";
         } else {
+            if ($actionable_count === 0) {
+                $content .= "<p><strong>✓ No application errors or operational warnings</strong> - only routine feed/media fetch noise below.</p>";
+            }
+
             // Exceptions section
             if (!empty($issues['exceptions'])) {
                 $content .= "<h3>Exceptions (" . count($issues['exceptions']) . ")</h3>";
@@ -1377,32 +1537,63 @@ class Af_Feed_Advisor extends Plugin
                 $content .= "</ul>";
             }
 
-            // Errors section
-            if (!empty($issues['errors'])) {
-                $content .= "<h3>Errors (" . count($issues['errors']) . ")</h3>";
+            // Application errors section
+            if (!empty($issues['app_errors'])) {
+                $content .= "<h3>Application Errors (" . count($issues['app_errors']) . ")</h3>";
                 $content .= "<ul>";
-                foreach ($issues['errors'] as $issue) {
+                foreach ($issues['app_errors'] as $issue) {
                     $count_text = $issue['count'] > 1 ? " ({$issue['count']} occurrences)" : "";
                     $content .= "<li><code>" . htmlspecialchars($issue['message']) . "</code>{$count_text}</li>";
                 }
                 $content .= "</ul>";
             }
 
-            // Warnings section
-            if (!empty($issues['warnings'])) {
-                $content .= "<h3>Warnings (" . count($issues['warnings']) . ")</h3>";
+            // Infrastructure warnings section
+            if (!empty($issues['infra_warnings'])) {
+                $content .= "<h3>Infrastructure Warnings (" . count($issues['infra_warnings']) . ")</h3>";
                 $content .= "<ul>";
-                foreach ($issues['warnings'] as $issue) {
+                foreach ($issues['infra_warnings'] as $issue) {
                     $count_text = $issue['count'] > 1 ? " ({$issue['count']} occurrences)" : "";
                     $content .= "<li><code>" . htmlspecialchars($issue['message']) . "</code>{$count_text}</li>";
                 }
                 $content .= "</ul>";
+            }
+
+            // Feed fetch failures - collapsed to a category breakdown rather
+            // than one line per occurrence, since persistently-broken feeds
+            // are already tracked in detail by the Feed Health report.
+            if ($issues['feed_fetch_total'] > 0) {
+                $url_count = count($issues['feed_fetch_urls']);
+                $content .= "<h3>Feed Fetch Failures</h3>";
+                $content .= "<p>{$issues['feed_fetch_total']} failed fetch attempts across {$url_count} feed(s):</p>";
+                $content .= "<ul>";
+                foreach ($issues['feed_fetch_categories'] as $label => $count) {
+                    $content .= "<li>" . htmlspecialchars($label) . ": {$count}</li>";
+                }
+                $content .= "</ul>";
+                $content .= "<p><small>Feeds broken for 7+ days are tracked separately in the Feed Health report.</small></p>";
+            }
+
+            // Media/enclosure caching noise - collapsed to a total plus top
+            // offending domains, since this is almost always external link
+            // rot (dead images, hotlink protection), not an app problem.
+            if ($issues['media_cache_total'] > 0) {
+                $content .= "<h3>Media/Enclosure Caching (" . $issues['media_cache_total'] . ")</h3>";
+                $content .= "<p>Failed attempts to cache external images/enclosures - usually dead links or blocked hotlinking on the source site, not a Rhesus/TT-RSS problem.</p>";
+                if (!empty($issues['media_cache_domains'])) {
+                    $top_domains = array_slice($issues['media_cache_domains'], 0, 5, true);
+                    $domain_list = array();
+                    foreach ($top_domains as $domain => $count) {
+                        $domain_list[] = htmlspecialchars($domain) . " ({$count})";
+                    }
+                    $content .= "<p><small>Top domains: " . implode(', ', $domain_list) . "</small></p>";
+                }
             }
         }
 
         $content .= "<hr>";
         $content .= "<p><small>Monitoring period: Last 24 hours<br>";
-        $content .= "Total issues: {$total_issues}</small></p>";
+        $content .= "Application issues: {$actionable_count} &middot; Feed fetch failures: {$issues['feed_fetch_total']} &middot; Media caching noise: {$issues['media_cache_total']}</small></p>";
         $content .= "</div>";
 
         // Create the advisory article. GUID includes full timestamp (not
@@ -1626,10 +1817,28 @@ class Af_Feed_Advisor extends Plugin
         print "<tr><td width='40%'>" . __("Insert at") . "</td>";
         print "<td><input type='datetime-local' id='af-advisor-notif-datetime'>" .
             "<div style='font-size:11px;opacity:0.7;margin-top:2px'>" . __("Your local time zone - converted automatically.") . "</div></td></tr>";
+        print "<tr><td width='40%'>" . __("Repeat") . "</td>";
+        print "<td>";
+        print "<label style='display:inline-flex;align-items:center;gap:6px'>";
+        print "<input type='checkbox' id='af-advisor-notif-repeat-enabled' onchange=\"" .
+            "document.getElementById('af-advisor-notif-repeat-quantity').disabled = !this.checked; " .
+            "document.getElementById('af-advisor-notif-repeat-unit').disabled = !this.checked;\">";
+        print __("Repeat every");
+        print "</label> ";
+        print "<input type='number' id='af-advisor-notif-repeat-quantity' min='1' value='1' style='width:60px' disabled> ";
+        print "<select id='af-advisor-notif-repeat-unit' disabled>";
+        print "<option value='days'>" . __("Days") . "</option>";
+        print "<option value='weeks'>" . __("Weeks") . "</option>";
+        print "<option value='months'>" . __("Months") . "</option>";
+        print "<option value='years'>" . __("Years") . "</option>";
+        print "</select>";
+        print "</td></tr>";
         print "</table>";
         print "<style>#af-advisor-notif-create .dijitButtonNode { background: #1a73e8 !important; border-color: #1165c4 !important; } #af-advisor-notif-create .dijitButtonText { color: #fff !important; }</style>";
         print "<p id='af-advisor-notif-create'><button dojoType='dijit.form.Button' onclick='return Plugins.Af_Feed_Advisor.createNotificationArticle()'>" .
             __("Create Notification Article") . "</button></p>";
+
+        $this->render_recurring_notifications_list((int)$_SESSION['uid']);
 
         // Bulk operations
         print "<h2>Bulk Operations</h2>";
@@ -1743,6 +1952,9 @@ class Af_Feed_Advisor extends Plugin
             var title = document.getElementById('af-advisor-notif-title').value;
             var content = document.getElementById('af-advisor-notif-content').value;
             var insertAtLocal = document.getElementById('af-advisor-notif-datetime').value;
+            var repeatEnabled = document.getElementById('af-advisor-notif-repeat-enabled').checked;
+            var repeatQuantity = document.getElementById('af-advisor-notif-repeat-quantity').value;
+            var repeatUnit = document.getElementById('af-advisor-notif-repeat-unit').value;
 
             if (!title.trim()) {
                 Notify.error('Title is required.');
@@ -1750,6 +1962,10 @@ class Af_Feed_Advisor extends Plugin
             }
             if (!insertAtLocal) {
                 Notify.error('Insertion date/time is required.');
+                return false;
+            }
+            if (repeatEnabled && (!repeatQuantity || parseInt(repeatQuantity, 10) < 1)) {
+                Notify.error('Repeat interval must be at least 1.');
                 return false;
             }
 
@@ -1769,10 +1985,14 @@ class Af_Feed_Advisor extends Plugin
 
             Notify.progress('Creating article...', true);
             xhr.json('backend.php', {op: 'PluginHandler', plugin: 'af_feed_advisor', method: 'createNotificationArticle',
-                title: title, content: content, insert_at: insertAtUtc})
+                title: title, content: content, insert_at: insertAtUtc,
+                repeat_enabled: repeatEnabled ? '1' : '0', repeat_quantity: repeatQuantity, repeat_unit: repeatUnit})
                 .then(function(r) {
                     if (r.error) {
                         Notify.error(r.error);
+                    } else if (r.repeating) {
+                        Notify.info('Notification article created, repeat scheduled.');
+                        location.reload();
                     } else {
                         Notify.info('Notification article created.');
                         document.getElementById('af-advisor-notif-title').value = '';
@@ -1783,6 +2003,20 @@ class Af_Feed_Advisor extends Plugin
                         // article list) is what actually re-applies sort order.
                         var when = insertAtDate.toLocaleString();
                         alert('\"' + title + '\" article created for ' + when + '\\n\\nYou may need to refresh your article list for the new article to properly be included.');
+                    }
+                });
+            return false;
+        };
+
+        Plugins.Af_Feed_Advisor.stopRecurringNotification = function(id) {
+            if (!confirm('Stop this recurring notification? Articles already created by it are not affected.')) return false;
+            xhr.json('backend.php', {op: 'PluginHandler', plugin: 'af_feed_advisor', method: 'stopRecurringNotification', id: id})
+                .then(function(r) {
+                    if (r.error) {
+                        Notify.error(r.error);
+                    } else {
+                        Notify.info('Recurring notification stopped.');
+                        location.reload();
                     }
                 });
             return false;
@@ -1862,40 +2096,17 @@ class Af_Feed_Advisor extends Plugin
         echo json_encode(['issues_found' => $issues_found]);
     }
 
-    /**
-     * AJAX handler: Creates a standalone article (same feed-less/"Archived"
-     * shape as the health report articles below) whose date_entered - the
-     * column TT-RSS actually sorts headlines by - is the user-chosen
-     * insertion time, which may be in the past or future. `updated`/
-     * `date_updated` are always NOW(), so the article's own displayed date
-     * is when it was really created, independent of where it sorts.
-     */
-    function createNotificationArticle()
-    {
-        header('Content-Type: application/json');
+    const RECURRING_UNITS = ['days', 'weeks', 'months', 'years'];
 
-        $title = trim(strip_tags($_POST['title'] ?? ''));
-        $content_raw = trim($_POST['content'] ?? '');
-        $insert_at = trim($_POST['insert_at'] ?? '');
-
-        if ($title === '') {
-            echo json_encode(['error' => 'Title is required.']);
-            return;
-        }
-
-        $insert_ts = $insert_at !== '' ? strtotime($insert_at) : false;
-        if ($insert_ts === false) {
-            echo json_encode(['error' => 'Invalid date/time.']);
-            return;
-        }
-
-        $owner_uid = (int)$_SESSION['uid'];
+    // Shared by createNotificationArticle() (immediate, one-time creation)
+    // and process_recurring_notifications() (housekeeping-driven repeat
+    // creation) - inserts one notification article. $date_entered_ts
+    // controls where it sorts (see createNotificationArticle()'s docblock).
+    // Returns the new entry id, or null on failure (duplicate guid or a DB
+    // error, already logged either way).
+    private function create_notification_article_entry(int $owner_uid, string $title, string $content_html, int $date_entered_ts): ?int {
         $pdo = Db::pdo();
-
-        // Plain-text textarea input, not trusted HTML - escape then restore
-        // line breaks, rather than storing the raw value as article content.
-        $content_html = nl2br(htmlspecialchars($content_raw));
-        $date_entered = date('Y-m-d H:i:s', $insert_ts);
+        $date_entered = date('Y-m-d H:i:s', $date_entered_ts);
         $guid = 'feed-advisor:notification:' . uniqid('', true) . '-uid' . $owner_uid;
         $content_hash = 'SHA1:' . sha1($content_html);
 
@@ -1911,8 +2122,8 @@ class Af_Feed_Advisor extends Plugin
             $entry_id = $sth->fetchColumn();
 
             if (!$entry_id) {
-                echo json_encode(['error' => 'Could not create article (duplicate guid, please retry).']);
-                return;
+                Debug::log("Feed Advisor: Notification article insert produced no id (duplicate guid?) for uid={$owner_uid}");
+                return null;
             }
 
             $feed_id = $this->get_or_create_advisor_feed_id($owner_uid);
@@ -1925,11 +2136,146 @@ class Af_Feed_Advisor extends Plugin
             $sth->execute([$entry_id, $feed_id, $owner_uid]);
 
             Debug::log("Feed Advisor: Created notification article '{$title}' (id={$entry_id}) for uid={$owner_uid}, inserted at {$date_entered}.");
-            echo json_encode(['success' => true, 'id' => $entry_id]);
+            return (int)$entry_id;
         } catch (Exception $e) {
             Debug::log("Feed Advisor: Failed to create notification article: " . $e->getMessage());
-            echo json_encode(['error' => 'Failed to create article.']);
+            return null;
         }
+    }
+
+    // Processes every recurring notification schedule that's come due,
+    // creating a fresh article for each (date_entered = NOW(), since the
+    // whole point of a recurring reminder is to show up at roughly when it
+    // actually fires, not backdated to the original schedule's setup time)
+    // and advancing next_due_at by one more interval. Anchored to the
+    // previous next_due_at rather than to NOW() when advancing, so a
+    // housekeeping pass that runs a bit late doesn't drift the schedule
+    // forward - it stays locked to the original cadence.
+    private function process_recurring_notifications(): void {
+        $pdo = Db::pdo();
+
+        $sth = $pdo->prepare("
+            SELECT id, owner_uid, title, content, interval_quantity, interval_unit, next_due_at
+            FROM ttrss_plugin_feed_advisor_recurring
+            WHERE next_due_at <= NOW()
+        ");
+        $sth->execute();
+
+        foreach ($sth->fetchAll() as $row) {
+            $entry_id = $this->create_notification_article_entry(
+                (int)$row['owner_uid'], $row['title'], $row['content'] ?? '', time()
+            );
+
+            if ($entry_id) {
+                $quantity = (int)$row['interval_quantity'];
+                $unit = $row['interval_unit'];
+                $update_sth = $pdo->prepare("
+                    UPDATE ttrss_plugin_feed_advisor_recurring
+                    SET next_due_at = next_due_at + CAST(? AS INTERVAL)
+                    WHERE id = ?
+                ");
+                $update_sth->execute(["{$quantity} {$unit}", $row['id']]);
+
+                Debug::log("Feed Advisor: Recurring notification '{$row['title']}' (schedule id={$row['id']}) fired, next due in {$quantity} {$unit}.");
+            }
+        }
+    }
+
+    /**
+     * AJAX handler: Creates a standalone article (same feed-less/"Archived"
+     * shape as the health report articles below) whose date_entered - the
+     * column TT-RSS actually sorts headlines by - is the user-chosen
+     * insertion time, which may be in the past or future. `updated`/
+     * `date_updated` are always NOW(), so the article's own displayed date
+     * is when it was really created, independent of where it sorts.
+     *
+     * If repeat_enabled is set, also registers a recurring schedule (see
+     * process_recurring_notifications()) that creates a new copy of this
+     * article every interval_quantity/interval_unit going forward - the
+     * "Insert at" value above only ever applies to this first, immediately
+     * created article; each repeat uses its own firing time instead.
+     */
+    function createNotificationArticle()
+    {
+        header('Content-Type: application/json');
+
+        $title = trim(strip_tags($_POST['title'] ?? ''));
+        $content_raw = trim($_POST['content'] ?? '');
+        $insert_at = trim($_POST['insert_at'] ?? '');
+        $repeat_enabled = ($_POST['repeat_enabled'] ?? '') === '1';
+        $repeat_quantity = (int)($_POST['repeat_quantity'] ?? 0);
+        $repeat_unit = $_POST['repeat_unit'] ?? '';
+
+        if ($title === '') {
+            echo json_encode(['error' => 'Title is required.']);
+            return;
+        }
+
+        $insert_ts = $insert_at !== '' ? strtotime($insert_at) : false;
+        if ($insert_ts === false) {
+            echo json_encode(['error' => 'Invalid date/time.']);
+            return;
+        }
+
+        if ($repeat_enabled) {
+            if ($repeat_quantity < 1) {
+                echo json_encode(['error' => 'Repeat interval must be at least 1.']);
+                return;
+            }
+            if (!in_array($repeat_unit, self::RECURRING_UNITS, true)) {
+                echo json_encode(['error' => 'Invalid repeat unit.']);
+                return;
+            }
+        }
+
+        $owner_uid = (int)$_SESSION['uid'];
+
+        // Plain-text textarea input, not trusted HTML - escape then restore
+        // line breaks, rather than storing the raw value as article content.
+        $content_html = nl2br(htmlspecialchars($content_raw));
+
+        $entry_id = $this->create_notification_article_entry($owner_uid, $title, $content_html, $insert_ts);
+
+        if (!$entry_id) {
+            echo json_encode(['error' => 'Could not create article (duplicate guid, please retry).']);
+            return;
+        }
+
+        if ($repeat_enabled) {
+            $pdo = Db::pdo();
+            $sth = $pdo->prepare("
+                INSERT INTO ttrss_plugin_feed_advisor_recurring
+                    (owner_uid, title, content, interval_quantity, interval_unit, next_due_at)
+                VALUES (?, ?, ?, ?, ?, NOW() + CAST(? AS INTERVAL))
+            ");
+            $sth->execute([
+                $owner_uid, $title, $content_html, $repeat_quantity, $repeat_unit,
+                "{$repeat_quantity} {$repeat_unit}",
+            ]);
+            Debug::log("Feed Advisor: Registered recurring notification '{$title}' for uid={$owner_uid}, every {$repeat_quantity} {$repeat_unit}.");
+        }
+
+        echo json_encode(['success' => true, 'id' => $entry_id, 'repeating' => $repeat_enabled]);
+    }
+
+    // AJAX handler: cancels a recurring notification schedule. Does not
+    // touch any articles already created by it - only stops future ones.
+    function stopRecurringNotification()
+    {
+        header('Content-Type: application/json');
+
+        $id = (int)($_POST['id'] ?? 0);
+        $owner_uid = (int)$_SESSION['uid'];
+
+        if (!$id) {
+            echo json_encode(['error' => 'Missing id.']);
+            return;
+        }
+
+        $sth = Db::pdo()->prepare("DELETE FROM ttrss_plugin_feed_advisor_recurring WHERE id = ? AND owner_uid = ?");
+        $sth->execute([$id, $owner_uid]);
+
+        echo json_encode(['success' => true]);
     }
 
     /**

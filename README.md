@@ -162,6 +162,7 @@ message, and a date/time you choose:
 | Title | Required |
 | Content | Optional plain text - stored escaped, with line breaks preserved. Not interpreted as HTML |
 | Insert at | Date/time the article sorts to in your article list, past or future. Entered and interpreted in **your browser's local time zone** - converted to UTC client-side before it's sent, so it doesn't depend on the server's time zone |
+| Repeat | Optional. If enabled, also creates a recurring schedule (see below) in addition to the one-time article created immediately |
 
 The key distinction is between *where the article sorts* and *when it was actually
 created*:
@@ -174,6 +175,24 @@ created*:
 
 The article is created unread, with no category, under the Feed Advisor feed like any
 other article this plugin generates.
+
+### Repeating notifications
+
+Checking "Repeat every" and picking a quantity/unit (days/weeks/months/years)
+registers a recurring schedule alongside the immediately-created article - a fresh copy
+of the same title/content is created every time the interval elapses, processed on
+TT-RSS's normal housekeeping cycle (`HOOK_HOUSE_KEEPING`, same as feed health checks).
+
+- The "Insert at" field only applies to the first, immediately-created article. Each
+  repeat instead uses its own firing time as `date_entered` - a recurring reminder is
+  meant to show up at roughly when it actually fires, not backdated to whenever the
+  schedule was originally set up.
+- The schedule is anchored to its own previous due time when advancing (`next_due_at =
+  next_due_at + interval`, not `NOW() + interval`), so a late-running housekeeping pass
+  doesn't drift the cadence forward over time.
+- Active schedules are listed under "Recurring Notifications" in this same settings
+  pane, each with a **Stop** button - stopping a schedule only cancels future
+  occurrences, it does not delete articles already created by it.
 
 ## Article GUIDs
 
