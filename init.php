@@ -1331,6 +1331,57 @@ class Af_Feed_Advisor extends Plugin
     }
 
     /**
+     * TT-RSS logs an HTTP client failure ("!! Last error: ... resulted in a
+     * `504 Gateway Timeout` response:" / "cache_media: failed with 400: ...
+     * response:") as one line, immediately followed by the raw response
+     * body as its own separate log line - visible as e.g. a plain
+     * "error code: 504" or a JSON blob like {"error": "..."}. That body
+     * line routinely contains the literal word "error", which would
+     * otherwise trip the generic ERROR/SQLSTATE match below and get
+     * reported as a standalone, context-free "Application Error" -
+     * duplicating (with less information) an issue already correctly
+     * counted under Feed Fetch Failures or Media/Enclosure Caching by the
+     * line just processed.
+     *
+     * Deliberately bounded to skipping at most one line, and only skips it
+     * at all when the parent line ends with a colon (what actually signals
+     * "body follows" in these logs - a feed/cache failure logged without a
+     * trailing colon has no body to swallow, e.g. most `!! Last error:`
+     * DNS/timeout lines) AND that next line doesn't look like a normal
+     * TT-RSS-internal log entry (no `[hh:mm:ss/pid]` prefix) - a real
+     * response body is raw, un-prefixed output.
+     *
+     * An earlier version of this method instead consumed lines until the
+     * next blank line, which was unsafe: docker.log interleaves output from
+     * many concurrently-running feed updates, so the "next blank line"
+     * after one match can be hundreds of thousands of lines away, in the
+     * middle of completely unrelated feeds' output - verified directly
+     * against this instance's actual log, where that approach drove
+     * feed_fetch_total from 1033 down to 1 by swallowing nearly the entire
+     * file after the very first match. Response bodies can also legitimately
+     * span many lines themselves (e.g. a full Cloudflare "Just a moment..."
+     * HTML challenge page), which no fixed-line bound fully accounts for -
+     * skipping only one line accepts that a longer body's remaining lines
+     * fall through unclassified (silently ignored, since HTML content
+     * essentially never matches the ERROR/WARNING keyword checks) rather
+     * than risk over-consuming real content again.
+     */
+    private function skip_http_response_body(array $output, int $line_index): int
+    {
+        if (!preg_match('/:\s*$/', rtrim($output[$line_index]))) {
+            return $line_index;
+        }
+        if ($line_index + 1 >= count($output)) {
+            return $line_index;
+        }
+        $next = $output[$line_index + 1];
+        if (trim($next) === '' || preg_match('/\[\d+:\d+:\d+\/\d+\]/', $next)) {
+            return $line_index;
+        }
+        return $line_index + 1;
+    }
+
+    /**
      * Parse Docker logs for warnings, errors, and exceptions.
      *
      * Buckets lines by what a human actually needs to act on, rather than
@@ -1349,7 +1400,37 @@ class Af_Feed_Advisor extends Plugin
      */
     private function parse_docker_logs()
     {
-        $issues = array(
+        // Check if log file is mounted (optional feature)
+        // To enable: docker run -v /var/run/docker.sock:/var/run/docker.sock
+        // Or mount a log file at /var/log/ttrss/docker.log
+        $log_file = '/var/log/ttrss/docker.log';
+
+        if (!file_exists($log_file)) {
+            Debug::log("Feed Advisor: Log file not found at {$log_file} - skipping system monitoring");
+            return $this->empty_log_issues();
+        }
+
+        // The time window is enforced by export-docker-logs.sh's `--since`
+        // flag when it writes this file, not here - we just read whatever
+        // range it exported.
+        $output = array();
+
+        $handle = fopen($log_file, 'r');
+        if (!$handle) {
+            return $this->empty_log_issues();
+        }
+
+        while (($line = fgets($handle)) !== false) {
+            $output[] = $line;
+        }
+        fclose($handle);
+
+        return $this->classify_log_lines($output);
+    }
+
+    private function empty_log_issues(): array
+    {
+        return array(
             'exceptions' => array(),
             'app_errors' => array(),
             'infra_warnings' => array(),
@@ -1359,42 +1440,33 @@ class Af_Feed_Advisor extends Plugin
             'media_cache_total' => 0,
             'media_cache_domains' => array(),
         );
+    }
+
+    /**
+     * Classifies an array of raw log lines (one docker.log line per array
+     * element, newline included or not) into the issues structure the
+     * system health report renders. Split out from parse_docker_logs() so
+     * this - the actual classification logic - can be unit tested directly
+     * against fixed input, without needing a real file on disk at the
+     * hardcoded /var/log/ttrss/docker.log path.
+     */
+    private function classify_log_lines(array $output): array
+    {
+        $issues = $this->empty_log_issues();
+
+        if (empty($output)) {
+            return $issues;
+        }
 
         try {
-            // Check if log file is mounted (optional feature)
-            // To enable: docker run -v /var/run/docker.sock:/var/run/docker.sock
-            // Or mount a log file at /var/log/ttrss/docker.log
-            $log_file = '/var/log/ttrss/docker.log';
-
-            if (!file_exists($log_file)) {
-                Debug::log("Feed Advisor: Log file not found at {$log_file} - skipping system monitoring");
-                return $issues;
-            }
-
-            // The time window is enforced by export-docker-logs.sh's `--since`
-            // flag when it writes this file, not here - we just read whatever
-            // range it exported.
-            $output = array();
-
-            $handle = fopen($log_file, 'r');
-            if (!$handle) {
-                return $issues;
-            }
-
-            while (($line = fgets($handle)) !== false) {
-                $output[] = $line;
-            }
-            fclose($handle);
-
-            if (empty($output)) {
-                return $issues;
-            }
-
             $exception_counts = array();
             $app_error_counts = array();
             $infra_warning_counts = array();
+            $line_count = count($output);
 
-            foreach ($output as $line) {
+            for ($i = 0; $i < $line_count; $i++) {
+                $line = $output[$i];
+
                 // Skip empty lines
                 if (trim($line) === '') {
                     continue;
@@ -1421,6 +1493,7 @@ class Af_Feed_Advisor extends Plugin
                     if ($domain) {
                         $issues['media_cache_domains'][$domain] = ($issues['media_cache_domains'][$domain] ?? 0) + 1;
                     }
+                    $i = $this->skip_http_response_body($output, $i);
                     continue;
                 }
 
@@ -1437,6 +1510,7 @@ class Af_Feed_Advisor extends Plugin
                     if ($url) {
                         $issues['feed_fetch_urls'][$url] = true;
                     }
+                    $i = $this->skip_http_response_body($output, $i);
                     continue;
                 }
 
