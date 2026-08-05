@@ -1297,9 +1297,11 @@ class Af_Feed_Advisor extends Plugin
     /**
      * Lines that match ERROR/WARNING purely by keyword but carry no
      * actionable signal for a human reader - routine housekeeping and
-     * plugin debug logging, not real problems.
+     * plugin debug logging, not real problems. $user_patterns is this
+     * user's own configurable filter list (see get_log_filter_patterns()),
+     * checked in addition to these built-in ones.
      */
-    private function is_ignorable_log_line(string $line): bool
+    private function is_ignorable_log_line(string $line, array $user_patterns = array()): bool
     {
         static $ignore_patterns = array(
             '/Removing old error log entries/',
@@ -1311,7 +1313,64 @@ class Af_Feed_Advisor extends Plugin
                 return true;
             }
         }
+        foreach ($user_patterns as $pattern) {
+            if ($this->matches_user_filter_pattern($line, $pattern)) {
+                return true;
+            }
+        }
         return false;
+    }
+
+    /**
+     * A user-defined filter pattern wrapped in slashes, with optional
+     * trailing PCRE flags (e.g. "/foo.*bar/i") - matching this plugin's own
+     * built-in ignore patterns' convention - is treated as a full regex.
+     * Anything else is a plain, case-insensitive substring match, so
+     * filtering out a specific noisy message never requires knowing regex
+     * syntax at all.
+     */
+    private function matches_user_filter_pattern(string $line, string $pattern): bool
+    {
+        $pattern = trim($pattern);
+        if ($pattern === '') {
+            return false;
+        }
+        if (preg_match('#^/.*/[a-zA-Z]*$#s', $pattern)) {
+            // Validate it actually compiles before trusting it, so a
+            // malformed regex degrades to "no match" instead of raising a
+            // PHP warning (which would itself show up as noise in the very
+            // report this feature exists to quiet) or corrupting the pass.
+            if (@preg_match($pattern, '') === false) {
+                return false;
+            }
+            return @preg_match($pattern, $line) === 1;
+        }
+        return stripos($line, $pattern) !== false;
+    }
+
+    /**
+     * This user's own configurable list of additional patterns to exclude
+     * from system health log classification entirely - see
+     * matches_user_filter_pattern() for the plain-text-or-regex rule, and
+     * hook_prefs_tab()'s "Log Filter Patterns" section for the UI.
+     */
+    private function get_log_filter_patterns(): array
+    {
+        // Must go through get_plugin_setting(), not $this->host->get()
+        // directly - the automatic daily report runs from housekeeping
+        // (owner_uid=0), where PluginHost::get() alone silently returns
+        // only the default, never whatever the admin actually saved via
+        // the web-session-scoped settings form. Every other setting in
+        // this file already goes through get_plugin_setting() for exactly
+        // this reason; this one was missed, so patterns saved via the UI
+        // were invisible to every report except one manually triggered via
+        // "Check System Health Now" in that same browser session.
+        $raw = $this->get_plugin_setting('log_filter_patterns', '[]');
+        if (!is_string($raw)) {
+            return array();
+        }
+        $decoded = json_decode($raw, true);
+        return is_array($decoded) ? $decoded : array();
     }
 
     /**
@@ -1365,6 +1424,14 @@ class Af_Feed_Advisor extends Plugin
      * fall through unclassified (silently ignored, since HTML content
      * essentially never matches the ERROR/WARNING keyword checks) rather
      * than risk over-consuming real content again.
+     *
+     * One deliberate, narrow exception to the one-line bound: an XML
+     * declaration line ("<?xml version=\"1.0\" ...?>", the first line of
+     * every S3 error response body, e.g. AuthorizationQueryParametersError)
+     * is always immediately followed by the actual XML content - safe to
+     * consume one further line specifically in that case, since an XML PI
+     * line has no other purpose and can't itself be a coincidental match
+     * against unrelated concurrent output.
      */
     private function skip_http_response_body(array $output, int $line_index): int
     {
@@ -1378,7 +1445,20 @@ class Af_Feed_Advisor extends Plugin
         if (trim($next) === '' || preg_match('/\[\d+:\d+:\d+\/\d+\]/', $next)) {
             return $line_index;
         }
-        return $line_index + 1;
+        $consumed = $line_index + 1;
+
+        // Every line still carries its docker-compose "servicename-N  | "
+        // prefix at this point (only extract_error_message() strips it,
+        // later, for display) - match the XML declaration anywhere in the
+        // line rather than anchoring to its start.
+        if (preg_match('/<\?xml\b/', $next) && $consumed + 1 < count($output)) {
+            $after = $output[$consumed + 1];
+            if (trim($after) !== '' && !preg_match('/\[\d+:\d+:\d+\/\d+\]/', $after)) {
+                $consumed++;
+            }
+        }
+
+        return $consumed;
     }
 
     /**
@@ -1463,6 +1543,7 @@ class Af_Feed_Advisor extends Plugin
             $app_error_counts = array();
             $infra_warning_counts = array();
             $line_count = count($output);
+            $user_filter_patterns = $this->get_log_filter_patterns();
 
             for ($i = 0; $i < $line_count; $i++) {
                 $line = $output[$i];
@@ -1472,7 +1553,7 @@ class Af_Feed_Advisor extends Plugin
                     continue;
                 }
 
-                if ($this->is_ignorable_log_line($line)) {
+                if ($this->is_ignorable_log_line($line, $user_filter_patterns)) {
                     continue;
                 }
 
@@ -1568,13 +1649,7 @@ class Af_Feed_Advisor extends Plugin
         $line = preg_replace('/^[^|]*\|\s*/', '', $line);
         $line = preg_replace('/^\[\d+:\d+:\d+\/\d+\]\s*/', '', $line);
 
-        // Extract just the error message (first 200 chars)
-        $line = trim($line);
-        if (strlen($line) > 200) {
-            $line = substr($line, 0, 200) . '...';
-        }
-
-        return $line;
+        return trim($line);
     }
 
     /**
@@ -1741,7 +1816,10 @@ class Af_Feed_Advisor extends Plugin
             evt.preventDefault();
             if (this.validate()) {
                 Notify.progress('Saving data...', true);
-                xhr.post('backend.php', this.getValues(), (reply) => {
+                const values = this.getValues();
+                const filterEl = document.getElementById('af-advisor-log-filter-patterns');
+                if (filterEl) values.log_filter_patterns = filterEl.value;
+                xhr.post('backend.php', values, (reply) => {
                     Notify.info(reply);
                 });
             }
@@ -1800,6 +1878,7 @@ class Af_Feed_Advisor extends Plugin
         $state = $this->get_state();
         $last_check = $state['last_log_check'] ?? 0;
         $last_check_str = $last_check ? date('Y-m-d H:i:s', $last_check) : 'Never';
+        $log_filter_patterns_text = implode("\n", $this->get_log_filter_patterns());
 
         print "<table>";
 
@@ -1861,6 +1940,20 @@ class Af_Feed_Advisor extends Plugin
 
         print "<tr><td colspan='2'><button dojoType='dijit.form.Button' onclick='return Plugins.Af_Feed_Advisor.checkSystemHealthNow()'>" .
             __("Check System Health Now") . "</button></td></tr>";
+
+        print "<tr><td width='40%' style='vertical-align:top'>" . __("Log filter patterns") . "</td>";
+        // Deliberately a plain <textarea>, not a dojo form widget - dijit.form.Textarea's
+        // module is never loaded elsewhere in TT-RSS (confirmed: this plugin was the
+        // only thing referencing it), so the declarative dojoType markup silently never
+        // became a real value widget and its content was dropped entirely from the
+        // form's own getValues() serialization on save. Read explicitly by id in the
+        // onSubmit handler above instead, the same way this file's notification-article
+        // content field already works.
+        print "<td><textarea id='af-advisor-log-filter-patterns' rows='4' style='width:100%;box-sizing:border-box'>" .
+            htmlspecialchars($log_filter_patterns_text) . "</textarea>" .
+            "<p style='margin:4px 0;color:#888'>" .
+            __('One per line. Log lines matching any of these are excluded entirely from the report - not just moved to a different section. Plain text matches as a case-insensitive substring anywhere in the line (e.g. "AWS4-HMAC" hides any AWS-signed-URL noise); a pattern wrapped in slashes with optional flags (e.g. "/timed out/i") is treated as a full regular expression.') .
+            "</p></td></tr>";
 
         print "<tr><td colspan='2'><h3 style='margin-bottom:4px'>Feed Enclosure Settings</h3></td></tr>";
 
@@ -2122,6 +2215,12 @@ class Af_Feed_Advisor extends Plugin
         $quiet_when_clean = checkbox_to_sql_bool($_POST['quiet_when_clean'] ?? '');
         $system_quiet_when_clean = checkbox_to_sql_bool($_POST['system_quiet_when_clean'] ?? '');
 
+        $log_filter_patterns_raw = (string)($_POST['log_filter_patterns'] ?? '');
+        $log_filter_patterns = array_values(array_filter(array_map(
+            'trim',
+            preg_split('/\r\n|\r|\n/', $log_filter_patterns_raw)
+        ), fn($line) => $line !== ''));
+
         $this->host->set($this, 'enabled', $enabled);
         $this->host->set($this, 'auto_apply', $auto_apply);
         $this->host->set($this, 'enclosure_check', $enclosure_check);
@@ -2132,6 +2231,7 @@ class Af_Feed_Advisor extends Plugin
         $this->host->set($this, 'stale_days', $stale_days);
         $this->host->set($this, 'report_interval_hours', $report_interval_hours);
         $this->host->set($this, 'system_check_interval_hours', $system_check_interval_hours);
+        $this->host->set($this, 'log_filter_patterns', json_encode($log_filter_patterns));
 
         echo __("Configuration saved.");
     }

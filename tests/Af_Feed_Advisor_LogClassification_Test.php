@@ -87,6 +87,30 @@ class Af_Feed_Advisor_LogClassification_Test extends TestCase
         $this->assertArrayHasKey('www.theglobeandmail.com', $issues['media_cache_domains']);
     }
 
+    // Real excerpt (S3's own error response format - a pre-signed
+    // bookface-images.s3.us-west-2.amazonaws.com URL rejected as expired)
+    // that produced a standalone, context-free "AuthorizationQueryParametersError"
+    // Application Error before this fix. Unlike a single-line JSON body,
+    // S3's XML error response spans two lines - the XML declaration line,
+    // then the actual "<Error>...</Error>" content - so the original
+    // one-line-only fix didn't fully absorb it.
+    public function test_two_line_xml_response_body_is_not_reported_as_app_error(): void
+    {
+        $lines = array(
+            "updater-1  | [12:07:34/273179] cache_enclosures: failed with 400: Client error: `GET https://bookface-images.s3.us-west-2.amazonaws.com/logos/abc.png?X-Amz-Algorithm=AWS4-HMAC-SHA256` resulted in a `400 Bad Request` response:\n",
+            "updater-1  | <?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "updater-1  | <Error><Code>AuthorizationQueryParametersError</Code><Message>Query-string authentication requires the Signature, Expires and AccessKeyId parameters</Message></Error>\n",
+            "updater-1  | \n",
+            "updater-1  | [12:07:35/273179] Base feed: https://example.com/feed\n",
+        );
+
+        $issues = $this->classify($lines);
+
+        $this->assertEmpty($issues['app_errors'], 'XML response body leaked through as a standalone app error');
+        $this->assertSame(1, $issues['media_cache_total']);
+        $this->assertArrayHasKey('bookface-images.s3.us-west-2.amazonaws.com', $issues['media_cache_domains']);
+    }
+
     // A feed-fetch line with no trailing colon (e.g. a DNS failure, which
     // has no HTTP response body at all) must NOT swallow the next line -
     // there's nothing to skip, so it should be classified normally.
@@ -117,5 +141,97 @@ class Af_Feed_Advisor_LogClassification_Test extends TestCase
 
         $this->assertCount(1, $issues['exceptions']);
         $this->assertSame('Something genuinely broke', $issues['exceptions'][0]['message']);
+    }
+
+    // Application error messages must never be truncated - a user
+    // explicitly asked for full log lines in the report, since a cut-off
+    // message (e.g. "...(truncated...)") often hides the one detail (a
+    // domain, a status code) needed to tell whether it's actionable.
+    public function test_app_error_message_is_not_truncated(): void
+    {
+        $long_message = str_repeat('x', 400);
+        $lines = array(
+            "updater-1  | [10:00:00/1] ERROR: {$long_message}\n",
+        );
+
+        $issues = $this->classify($lines);
+
+        $this->assertCount(1, $issues['app_errors']);
+        $this->assertStringContainsString($long_message, $issues['app_errors'][0]['message']);
+        $this->assertStringNotContainsString('...', $issues['app_errors'][0]['message']);
+    }
+
+    private function pluginWithFilterPatterns(array $patterns): Af_Feed_Advisor
+    {
+        $mockHost = $this->createMock(\PluginHost::class);
+        $mockHost->method('add_hook')->willReturn(true);
+        $mockHost->method('get')->willReturnCallback(
+            function ($plugin, $key, $default) use ($patterns) {
+                if ($key === 'log_filter_patterns') {
+                    return json_encode($patterns);
+                }
+                return $default;
+            }
+        );
+
+        $plugin = new Af_Feed_Advisor();
+        $plugin->init($mockHost);
+        return $plugin;
+    }
+
+    private function classifyWith(Af_Feed_Advisor $plugin, array $lines): array
+    {
+        $ref = new ReflectionClass($plugin);
+        $m = $ref->getMethod('classify_log_lines');
+        $m->setAccessible(true);
+        return $m->invoke($plugin, $lines);
+    }
+
+    // A user-configured plain-text pattern excludes any line containing it
+    // (case-insensitively) from the report entirely, not just from one
+    // section - it must not reappear as e.g. an infra warning either.
+    public function test_user_plain_text_filter_excludes_matching_line(): void
+    {
+        $plugin = $this->pluginWithFilterPatterns(array('AWS4-HMAC'));
+        $lines = array(
+            "updater-1  | [10:00:00/1] ERROR: signature mismatch for AWS4-HMAC-SHA256 request\n",
+            "updater-1  | [10:00:01/2] SQLSTATE[XX000]: unrelated real error\n",
+        );
+
+        $issues = $this->classifyWith($plugin, $lines);
+
+        $this->assertCount(1, $issues['app_errors']);
+        $this->assertStringContainsString('SQLSTATE', $issues['app_errors'][0]['message']);
+    }
+
+    // A user-configured pattern wrapped in slashes (with flags) is treated
+    // as a full regex, matching this plugin's own built-in ignore patterns'
+    // convention.
+    public function test_user_regex_filter_excludes_matching_line(): void
+    {
+        $plugin = $this->pluginWithFilterPatterns(array('/timed out/i'));
+        $lines = array(
+            "updater-1  | [10:00:00/1] !! Last error: cURL error 28: Operation TIMED OUT after 15000ms\n",
+        );
+
+        $issues = $this->classifyWith($plugin, $lines);
+
+        $this->assertSame(0, $issues['feed_fetch_total'], 'Filtered feed-fetch line should not be counted at all');
+    }
+
+    // A malformed user regex must degrade to "no match" rather than
+    // breaking classification of the rest of the log - a bad pattern
+    // shouldn't be able to corrupt or crash the whole report.
+    public function test_invalid_user_regex_does_not_break_classification(): void
+    {
+        $plugin = $this->pluginWithFilterPatterns(array('/unterminated['));
+        $lines = array(
+            "updater-1  | [10:00:00/1] SQLSTATE[XX000]: a real error\n",
+        );
+
+        $issues = $this->classifyWith($plugin, $lines);
+
+        $this->assertCount(1, $issues['app_errors']);
+        $this->assertStringContainsString('SQLSTATE', $issues['app_errors'][0]['message']);
     }
 }
