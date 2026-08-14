@@ -45,19 +45,22 @@ class Af_Feed_Advisor extends Plugin
     // Archived (feed_id NULL) indistinguishable from real archived articles.
     const ADVISOR_FEED_URL = 'feed-advisor:local';
 
-    // Rhesus runs as its own container on its own port (see docker-compose.yaml's
-    // rhesus-server service) rather than under the same host/path as TT-RSS
-    // itself, so a deep link into it has to assume this port rather than being
-    // derivable from the current request.
-    const RHESUS_PORT = 3001;
-
-    // Builds a link into Rhesus's article view for a given feed, using the
-    // current request's hostname (works whether accessed by IP, localhost, or
-    // a real domain) with Rhesus's own port substituted in.
+    // Builds a link into Rhesus's article view for a given feed. Deliberately
+    // just a root-relative path, not an absolute URL with a guessed host/port
+    // - Rhesus runs on its own port (see docker-compose.yaml's rhesus-server
+    // service), often reached through a further reverse proxy/Tailscale
+    // Serve remapping that port again, so there's no reliable way to derive
+    // "Rhesus's port" from the current request. A relative path sidesteps
+    // that entirely: this article's own `link` field is always an opaque
+    // "about:feed-advisor#..." URL (see the 3 places below that set it), and
+    // resolving a root-relative href against a non-hierarchical base throws
+    // (confirmed directly: `new URL("/feed/1", new URL("about:x"))` throws
+    // "Invalid URL") - Rhesus's own resolveRelativeUrls() (ArticleReader.vue)
+    // already catches that per-anchor and leaves the href untouched rather
+    // than mangling it, so this correctly resolves against whatever
+    // host/port is actually serving the page, with zero configuration.
     private function rhesus_feed_url($feed_id) {
-        $host = preg_replace('/:\d+$/', '', $_SERVER['HTTP_HOST'] ?? 'localhost');
-        $proto = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-        return "{$proto}://{$host}:" . self::RHESUS_PORT . "/feed/{$feed_id}";
+        return "/feed/{$feed_id}";
     }
 
     function about()
@@ -1390,6 +1393,27 @@ class Af_Feed_Advisor extends Plugin
     }
 
     /**
+     * Pulls a URL or bare hostname out of one PHP stack-trace line logged
+     * after an exception - e.g. "1. classes/UrlHelper.php(272):
+     * dns_get_record(transportationunit.com)" or "3. classes/UrlHelper.php
+     * (407): validate(https://transportationunit.com/feed/)". Prefers a
+     * full URL's host if one is present, otherwise falls back to whatever
+     * dotted-hostname-looking token appears in the frame's arguments -
+     * different frames in the same trace carry one or the other depending
+     * which function is being called.
+     */
+    private function extract_domain_from_trace_line(string $line): ?string
+    {
+        if (preg_match('/(https?:\/\/[^\s"\')\]]+)/', $line, $m)) {
+            return parse_url($m[1], PHP_URL_HOST) ?: null;
+        }
+        if (preg_match('/\(([a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+)\)/i', $line, $m)) {
+            return $m[1];
+        }
+        return null;
+    }
+
+    /**
      * TT-RSS logs an HTTP client failure ("!! Last error: ... resulted in a
      * `504 Gateway Timeout` response:" / "cache_media: failed with 400: ...
      * response:") as one line, immediately followed by the raw response
@@ -1540,6 +1564,7 @@ class Af_Feed_Advisor extends Plugin
 
         try {
             $exception_counts = array();
+            $exception_domains = array();
             $app_error_counts = array();
             $infra_warning_counts = array();
             $line_count = count($output);
@@ -1561,6 +1586,32 @@ class Af_Feed_Advisor extends Plugin
                 if (preg_match('/Exception: (.+)/', $line, $matches)) {
                     $error_msg = trim($matches[1]);
                     $exception_counts[$error_msg] = ($exception_counts[$error_msg] ?? 0) + 1;
+
+                    // The exception message itself never names the feed
+                    // (e.g. "dns_get_record(): A temporary server error
+                    // occurred." gives no clue which feed triggered it) -
+                    // but the PHP stack trace TT-RSS logs immediately after
+                    // often does, in the innermost frame's arguments (e.g.
+                    // "1. classes/UrlHelper.php(272):
+                    // dns_get_record(transportationunit.com)"). That frame
+                    // is logged by the same synchronous call as the
+                    // exception line, so it's reliably adjacent even with
+                    // other feeds updating concurrently - unlike scanning
+                    // for a distant delimiter (see skip_http_response_body's
+                    // comment above for why that's unsafe here). Bounded to
+                    // a few lines and stops as soon as a line doesn't look
+                    // like a numbered trace frame, so a run of unrelated
+                    // concurrent output can't be swallowed.
+                    for ($j = $i + 1; $j < min($i + 4, $line_count); $j++) {
+                        if (!preg_match('/\]\s*\d+\.\s/', $output[$j])) {
+                            break;
+                        }
+                        $domain = $this->extract_domain_from_trace_line($output[$j]);
+                        if ($domain) {
+                            $exception_domains[$error_msg][$domain] = true;
+                            break;
+                        }
+                    }
                     continue;
                 }
 
@@ -1616,7 +1667,11 @@ class Af_Feed_Advisor extends Plugin
 
             // Convert counts to issue arrays
             foreach ($exception_counts as $msg => $count) {
-                $issues['exceptions'][] = array('message' => $msg, 'count' => $count);
+                $issues['exceptions'][] = array(
+                    'message' => $msg,
+                    'count' => $count,
+                    'domains' => array_keys($exception_domains[$msg] ?? array()),
+                );
             }
             foreach ($app_error_counts as $msg => $count) {
                 $issues['app_errors'][] = array('message' => $msg, 'count' => $count);
@@ -1682,7 +1737,10 @@ class Af_Feed_Advisor extends Plugin
                 $content .= "<ul>";
                 foreach ($issues['exceptions'] as $issue) {
                     $count_text = $issue['count'] > 1 ? " ({$issue['count']} occurrences)" : "";
-                    $content .= "<li><code>" . htmlspecialchars($issue['message']) . "</code>{$count_text}</li>";
+                    $domains_text = !empty($issue['domains'])
+                        ? " — " . htmlspecialchars(implode(', ', $issue['domains']))
+                        : "";
+                    $content .= "<li><code>" . htmlspecialchars($issue['message']) . "</code>{$count_text}{$domains_text}</li>";
                 }
                 $content .= "</ul>";
             }

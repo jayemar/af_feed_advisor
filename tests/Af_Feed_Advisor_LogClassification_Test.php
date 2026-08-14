@@ -143,6 +143,75 @@ class Af_Feed_Advisor_LogClassification_Test extends TestCase
         $this->assertSame('Something genuinely broke', $issues['exceptions'][0]['message']);
     }
 
+    // Real excerpt: an exception message alone (e.g. "dns_get_record(): A
+    // temporary server error occurred.") gives no way to tell which feed
+    // triggered it. The stack trace TT-RSS logs immediately after often
+    // names it in the innermost frame's arguments - this should be pulled
+    // out and attached to the issue instead of silently discarded.
+    public function test_exception_domain_is_extracted_from_following_trace_line(): void
+    {
+        $lines = array(
+            "updater-1  | [12:44:21/18637] !! Exception: dns_get_record(): A temporary server error occurred. (classes/UrlHelper.php:272)\n",
+            "updater-1  | [12:44:21/18637] 1. classes/UrlHelper.php(272): dns_get_record(transportationunit.com)\n",
+        );
+
+        $issues = $this->classify($lines);
+
+        $this->assertCount(1, $issues['exceptions']);
+        $this->assertSame(array('transportationunit.com'), $issues['exceptions'][0]['domains']);
+    }
+
+    // A trace frame can carry a full URL instead of a bare hostname (e.g.
+    // UrlHelper::validate()'s own frame) - only the host should be kept,
+    // matching how feed_fetch_urls/media_cache_domains report domains
+    // elsewhere in this same report.
+    public function test_exception_domain_is_extracted_from_url_in_trace_line(): void
+    {
+        $lines = array(
+            "updater-1  | [12:44:21/18637] !! Exception: dns_get_record(): A temporary server error occurred. (classes/UrlHelper.php:272)\n",
+            "updater-1  | [12:44:21/18637] 3. classes/UrlHelper.php(407): validate(https://transportationunit.com/feed/)\n",
+        );
+
+        $issues = $this->classify($lines);
+
+        $this->assertSame(array('transportationunit.com'), $issues['exceptions'][0]['domains']);
+    }
+
+    // Repeated occurrences of the same exception across different feeds
+    // should collect each distinct domain once, not duplicate or drop any.
+    public function test_exception_domains_are_deduplicated_across_occurrences(): void
+    {
+        $lines = array(
+            "updater-1  | [10:00:00/1] !! Exception: dns_get_record(): A temporary server error occurred. (classes/UrlHelper.php:272)\n",
+            "updater-1  | [10:00:00/1] 1. classes/UrlHelper.php(272): dns_get_record(example-a.com)\n",
+            "updater-1  | [11:00:00/2] !! Exception: dns_get_record(): A temporary server error occurred. (classes/UrlHelper.php:272)\n",
+            "updater-1  | [11:00:00/2] 1. classes/UrlHelper.php(272): dns_get_record(example-a.com)\n",
+            "updater-1  | [12:00:00/3] !! Exception: dns_get_record(): A temporary server error occurred. (classes/UrlHelper.php:272)\n",
+            "updater-1  | [12:00:00/3] 1. classes/UrlHelper.php(272): dns_get_record(example-b.com)\n",
+        );
+
+        $issues = $this->classify($lines);
+
+        $this->assertCount(1, $issues['exceptions']);
+        $this->assertSame(3, $issues['exceptions'][0]['count']);
+        sort($issues['exceptions'][0]['domains']);
+        $this->assertSame(array('example-a.com', 'example-b.com'), $issues['exceptions'][0]['domains']);
+    }
+
+    // No trace line, or one that doesn't look like a numbered frame,
+    // should leave domains empty rather than error - the report still
+    // needs to render a plain count-only entry for these.
+    public function test_exception_without_trace_line_has_no_domains(): void
+    {
+        $lines = array(
+            "updater-1  | [10:00:00/1] Uncaught Exception: Something genuinely broke\n",
+        );
+
+        $issues = $this->classify($lines);
+
+        $this->assertSame(array(), $issues['exceptions'][0]['domains']);
+    }
+
     // Application error messages must never be truncated - a user
     // explicitly asked for full log lines in the report, since a cut-off
     // message (e.g. "...(truncated...)") often hides the one detail (a
