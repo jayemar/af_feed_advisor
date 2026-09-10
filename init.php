@@ -59,8 +59,17 @@ class Af_Feed_Advisor extends Plugin
     // already catches that per-anchor and leaves the href untouched rather
     // than mangling it, so this correctly resolves against whatever
     // host/port is actually serving the page, with zero configuration.
-    private function rhesus_feed_url($feed_id) {
-        return "/feed/{$feed_id}";
+    //
+    // Rhesus uses hash-based routing (createWebHashHistory) - everything
+    // that actually matters to the router lives after the "#". A bare
+    // "/feed/<id>" (no "#") loads the app fine but the router itself never
+    // sees a route in it and falls back to the default view; confirmed
+    // directly (Playwright) that "/feed/698" lands on "#/feed/-4", not the
+    // intended feed - this was a real, previously-undetected bug in the old
+    // "Rhesus" link this replaces. ?editFeed=<id> is read by AppShell.vue/
+    // FeedEditor.vue to open straight to that feed's edit dialog.
+    private function rhesus_edit_feed_url($feed_id) {
+        return "/#/feed/{$feed_id}?editFeed={$feed_id}";
     }
 
     function about()
@@ -1064,8 +1073,22 @@ class Af_Feed_Advisor extends Plugin
         }
         $title = "Feed Health Report" . (!empty($parts) ? ': ' . implode(', ', $parts) : ': all clear');
 
+        // Plain link to TT-RSS's own settings (no session-forwarding sid,
+        // unlike the equivalent link on the Rhesus settings page) - this
+        // report is persisted article content, potentially read long after
+        // whatever session generated it has expired, so it relies on the
+        // browser's own already-authenticated cookie session for the
+        // classic UI instead, the same fallback Rhesus's own link uses when
+        // it has no live sid to forward.
+        $ttrss_settings_icon = "<a href=\"/tt-rss/prefs.php\" target=\"_blank\" rel=\"noopener\" title=\"Open TT-RSS settings\" " .
+            "style=\"display:inline-flex;align-items:center;vertical-align:middle;margin-left:6px;\">" .
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" " .
+            "stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">" .
+            "<path d=\"M15 3h6v6\"/><path d=\"M10 14 21 3\"/>" .
+            "<path d=\"M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6\"/></svg></a>";
+
         $content = "<div class='feed-advisor-article'>";
-        $content .= "<h2>Feed Health Report</h2>";
+        $content .= "<h2>Feed Health Report{$ttrss_settings_icon}</h2>";
         $content .= "<p><strong>Generated:</strong> {$timestamp}</p>";
 
         // Broken feeds section
@@ -1076,7 +1099,7 @@ class Af_Feed_Advisor extends Plugin
             $content .= "<p>{$broken_count} feed" . ($broken_count !== 1 ? 's have' : ' has') .
                         " been failing for more than {$broken_days} days.</p>";
             $content .= "<table>";
-            $content .= "<tr><th>Feed</th><th>Error Type</th><th>Last Success</th><th>Broken For</th><th>Suggestion</th><th>Links</th></tr>";
+            $content .= "<tr><th>Feed</th><th>Error Type</th><th>Last Success</th><th>Suggestion</th></tr>";
 
             foreach ($broken_feeds as $feed) {
                 $error_info = $this->categorize_feed_error($feed['last_error']);
@@ -1084,27 +1107,26 @@ class Af_Feed_Advisor extends Plugin
                 if ($feed['last_successful_update']) {
                     $last_success = new DateTime($feed['last_successful_update']);
                     $days_broken = (int)(new DateTime())->diff($last_success)->days;
-                    $last_success_str = $feed['last_successful_update'];
+                    $last_success_str = $last_success->format('Y-m-d') . " ({$days_broken}d)";
                 } else {
-                    $days_broken = null;
                     $last_success_str = 'Never';
                 }
 
-                $days_str = ($days_broken !== null) ? "{$days_broken}d" : 'Unknown';
-
-                $feed_link = "<a href=\"" . htmlspecialchars($feed['feed_url']) . "\" target=\"_blank\" rel=\"noopener\">" .
+                // No target="_blank": this is a same-origin "/#/feed/..."
+                // hash link, and Rhesus uses hash-based routing - clicking
+                // it just changes the URL hash on whatever tab the report
+                // is already open in (e.g. read as a Rhesus article), which
+                // Vue Router picks up and re-routes without a full page
+                // reload. Confirmed directly (Playwright): a page-level JS
+                // marker survives the click, so this is real client-side
+                // navigation, not a fresh page load.
+                $feed_link = "<a href=\"" . htmlspecialchars($this->rhesus_edit_feed_url($feed['id'])) . "\">" .
                              htmlspecialchars($feed['title']) . "</a>";
-                $links = "<a href=\"" . htmlspecialchars($this->rhesus_feed_url($feed['id'])) . "\" target=\"_blank\" rel=\"noopener\">Rhesus</a>";
-                if (!empty($feed['site_url'])) {
-                    $links .= " &middot; <a href=\"" . htmlspecialchars($feed['site_url']) . "\" target=\"_blank\" rel=\"noopener\">Site</a>";
-                }
                 $content .= "<tr>";
                 $content .= "<td>{$feed_link}</td>";
                 $content .= "<td>{$error_info['label']}</td>";
                 $content .= "<td>{$last_success_str}</td>";
-                $content .= "<td>{$days_str}</td>";
                 $content .= "<td>{$error_info['suggestion']}</td>";
-                $content .= "<td>{$links}</td>";
                 $content .= "</tr>";
             }
 
@@ -1119,24 +1141,26 @@ class Af_Feed_Advisor extends Plugin
             $content .= "<p>{$stale_count} feed" . ($stale_count !== 1 ? 's have' : ' has') .
                         " not published a new article in more than {$stale_days} days.</p>";
             $content .= "<table>";
-            $content .= "<tr><th>Feed</th><th>Last Article</th><th>Days Silent</th><th>Links</th></tr>";
+            $content .= "<tr><th>Feed</th><th>Last Article</th></tr>";
 
             foreach ($stale_feeds as $feed) {
-                $last_date = $feed['last_article_date'];
-                $last_dt = new DateTime($last_date);
+                $last_dt = new DateTime($feed['last_article_date']);
                 $days_silent = (int)(new DateTime())->diff($last_dt)->days;
+                $last_date_str = $last_dt->format('Y-m-d') . " ({$days_silent}d)";
 
-                $feed_link = "<a href=\"" . htmlspecialchars($feed['feed_url']) . "\" target=\"_blank\" rel=\"noopener\">" .
+                // No target="_blank": this is a same-origin "/#/feed/..."
+                // hash link, and Rhesus uses hash-based routing - clicking
+                // it just changes the URL hash on whatever tab the report
+                // is already open in (e.g. read as a Rhesus article), which
+                // Vue Router picks up and re-routes without a full page
+                // reload. Confirmed directly (Playwright): a page-level JS
+                // marker survives the click, so this is real client-side
+                // navigation, not a fresh page load.
+                $feed_link = "<a href=\"" . htmlspecialchars($this->rhesus_edit_feed_url($feed['id'])) . "\">" .
                              htmlspecialchars($feed['title']) . "</a>";
-                $links = "<a href=\"" . htmlspecialchars($this->rhesus_feed_url($feed['id'])) . "\" target=\"_blank\" rel=\"noopener\">Rhesus</a>";
-                if (!empty($feed['site_url'])) {
-                    $links .= " &middot; <a href=\"" . htmlspecialchars($feed['site_url']) . "\" target=\"_blank\" rel=\"noopener\">Site</a>";
-                }
                 $content .= "<tr>";
                 $content .= "<td>{$feed_link}</td>";
-                $content .= "<td>{$last_date}</td>";
-                $content .= "<td>{$days_silent}d</td>";
-                $content .= "<td>{$links}</td>";
+                $content .= "<td>{$last_date_str}</td>";
                 $content .= "</tr>";
             }
 
