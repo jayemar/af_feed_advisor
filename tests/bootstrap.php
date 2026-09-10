@@ -13,6 +13,7 @@ class PluginHost
     const HOOK_ARTICLE_FILTER = 1;
     const HOOK_PREFS_TAB = 4;
     const HOOK_HOUSE_KEEPING = 10;
+    const HOOK_FETCH_FEED = 11;
 
     public function add_hook($hook, $plugin, $priority = 10) { return true; }
     public function get($plugin, $key, $default = null) { return $default; }
@@ -47,6 +48,25 @@ class Db
     {
         self::$pdo_call_count++;
         throw new \RuntimeException('Database not available in unit tests');
+    }
+}
+
+// Controllable test double for TT-RSS's real UrlHelper::fetch() - tests set
+// $fetch_return / $fetch_exception and inspect $last_fetch_options to assert
+// on the URL a caller requested.
+class UrlHelper
+{
+    public static $fetch_return = null;
+    public static $fetch_exception = null;
+    public static ?array $last_fetch_options = null;
+
+    public static function fetch($options)
+    {
+        self::$last_fetch_options = $options;
+        if (self::$fetch_exception) {
+            throw self::$fetch_exception;
+        }
+        return self::$fetch_return;
     }
 }
 

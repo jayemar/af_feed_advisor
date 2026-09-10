@@ -39,6 +39,16 @@ class Af_Feed_Advisor extends Plugin
     const REPORT_INTERVAL_HOURS = 24;
     const SYSTEM_CHECK_INTERVAL_HOURS = 24;
 
+    // Internal-only sidecar (see docker-compose.yaml) that fetches a URL
+    // with a real headless Chromium instance, for feeds whose anti-bot
+    // protection blocks TT-RSS's own HTTP client but allows a real browser.
+    // Deliberately port 80 (no explicit :port in this URL) - UrlHelper's own
+    // SSRF guard (has_disallowed_ip()) rejects a private/internal-looking
+    // IP, which this sidecar's Docker hostname resolves to, whenever the
+    // URL uses a non-standard port. Port 80/443/unspecified is the only way
+    // this fetch stays inside UrlHelper's trusted range.
+    const BROWSER_FETCH_PROXY_URL = 'http://browser-fetch-proxy/fetch?url=';
+
     // Synthetic feed this plugin's own articles (health reports, system
     // advisories, notification articles) are attached to, so they get a
     // proper name/icon and a place in the feed tree instead of landing in
@@ -90,6 +100,7 @@ class Af_Feed_Advisor extends Plugin
         $host->add_hook($host::HOOK_ARTICLE_FILTER, $this);
         $host->add_hook($host::HOOK_PREFS_TAB, $this);
         $host->add_hook($host::HOOK_HOUSE_KEEPING, $this);
+        $host->add_hook($host::HOOK_FETCH_FEED, $this);
     }
 
     // Recurring notification-article schedules, processed on each
@@ -1401,6 +1412,59 @@ class Af_Feed_Advisor extends Plugin
     }
 
     /**
+     * Feed IDs configured to be fetched via the browser-fetch-proxy sidecar
+     * instead of TT-RSS's own HTTP client - see hook_fetch_feed() below.
+     */
+    private function get_browser_fetch_feed_ids(): array
+    {
+        $raw = $this->get_plugin_setting('browser_fetch_feed_ids', '[]');
+        if (!is_string($raw)) {
+            return array();
+        }
+        $decoded = json_decode($raw, true);
+        return is_array($decoded) ? array_map('intval', $decoded) : array();
+    }
+
+    /**
+     * Overrides TT-RSS's built-in fetch for feeds configured in "Browser-
+     * Rendered Feeds" (see hook_prefs_tab() below): some sites' anti-bot
+     * protection blocks TT-RSS's own HTTP client (even a matching browser
+     * User-Agent and TLS fingerprint) but allows a real browser, so those
+     * specific feeds are routed through the browser-fetch-proxy sidecar,
+     * which fetches the URL with an actual headless Chromium instance.
+     * Falls through to TT-RSS's normal fetch (by returning $feed_data
+     * unchanged) for every other feed, and if the sidecar itself fails.
+     *
+     * @see PluginHost::HOOK_FETCH_FEED
+     */
+    function hook_fetch_feed($feed_data, $fetch_url, $owner_uid, $feed, $last_article_timestamp, $auth_login, $auth_pass)
+    {
+        if (!in_array((int)$feed, $this->get_browser_fetch_feed_ids(), true)) {
+            return $feed_data;
+        }
+
+        $proxy_url = self::BROWSER_FETCH_PROXY_URL . urlencode($fetch_url);
+
+        try {
+            $result = UrlHelper::fetch(array(
+                'url' => $proxy_url,
+                'timeout' => 25,
+            ));
+        } catch (Exception $e) {
+            Debug::log("Feed Advisor: browser-fetch-proxy request failed for feed {$feed}: " . $e->getMessage());
+            return $feed_data;
+        }
+
+        if (!$result) {
+            Debug::log("Feed Advisor: browser-fetch-proxy returned no data for feed {$feed}, falling back to normal fetch.");
+            return $feed_data;
+        }
+
+        Debug::log("Feed Advisor: fetched feed {$feed} via browser-fetch-proxy (" . strlen($result) . " bytes).");
+        return $result;
+    }
+
+    /**
      * Best-effort extraction of the URL a fetch-failure log line refers to,
      * so media-caching noise can be grouped by source domain instead of by
      * (mostly unique) full URL.
@@ -1901,6 +1965,11 @@ class Af_Feed_Advisor extends Plugin
                 const values = this.getValues();
                 const filterEl = document.getElementById('af-advisor-log-filter-patterns');
                 if (filterEl) values.log_filter_patterns = filterEl.value;
+                const browserFetchList = document.getElementById('af-advisor-browser-fetch-list');
+                if (browserFetchList) {
+                    values.browser_fetch_feed_urls = Array.from(browserFetchList.querySelectorAll('li'))
+                        .map(li => li.dataset.url).join('\\n');
+                }
                 xhr.post('backend.php', values, (reply) => {
                     Notify.info(reply);
                 });
@@ -1948,6 +2017,26 @@ class Af_Feed_Advisor extends Plugin
             ) stale
         ");
         $stale_count = (int)$sth->fetchColumn();
+
+        // "Browser-Rendered Feeds" search-and-add list: search box covers
+        // every feed the current user owns (not just broken ones - useful
+        // to preconfigure a feed you know is fragile before it's failed
+        // long enough to show up anywhere else), scoped to the logged-in
+        // user only - other accounts (e.g. the "playwrite" Rhesus test
+        // account, which mirrors this account's feeds) have their own
+        // separate feed rows and would otherwise show up as confusing
+        // same-title duplicates. Stored setting is still a list of feed
+        // IDs (get_browser_fetch_feed_ids() / hook_fetch_feed() are
+        // unchanged) - save() resolves the submitted URLs back to IDs.
+        $session_uid = (int)($_SESSION['uid'] ?? 0);
+
+        $sth = $pdo->prepare("SELECT id, title, feed_url FROM ttrss_feeds WHERE owner_uid = ? ORDER BY title");
+        $sth->execute([$session_uid]);
+        $all_user_feeds = $sth->fetchAll(PDO::FETCH_ASSOC);
+
+        $browser_fetch_feed_ids = $this->get_browser_fetch_feed_ids();
+        $configured_feeds = array_values(array_filter($all_user_feeds,
+            fn($f) => in_array((int)$f['id'], $browser_fetch_feed_ids, true)));
 
         $interval_options = [
             1   => __('Hourly'),
@@ -1997,8 +2086,39 @@ class Af_Feed_Advisor extends Plugin
             "<li><strong>" . __('Currently stale feeds:') . "</strong> {$stale_count}</li>" .
             "</ul></td></tr>";
 
-        print "<tr><td colspan='2'><button dojoType='dijit.form.Button' onclick='return Plugins.Af_Feed_Advisor.checkHealthNow()'>" .
-            __("Check Feed Health Now") . "</button></td></tr>";
+        print "<tr><td colspan='2'><h3 style='margin-bottom:4px'>Browser-Rendered Feeds</h3></td></tr>";
+        print "<tr><td colspan='2'><p style='margin:4px 0'>" .
+            __('For feeds whose anti-bot protection blocks TT-RSS\'s own HTTP client (403s that a real browser has no trouble with), route the fetch through a headless-Chromium sidecar instead. Only add feeds this is actually needed for - it\'s much slower than a normal fetch.') .
+            "</p></td></tr>";
+        // Feed catalog for the search box lives in a data-* attribute, not an
+        // inline <script> - this whole fragment is loaded via AJAX into a
+        // dojo-parsed, deeply widget-nested chunk of the page (many other
+        // plugins' HOOK_PREFS_TAB output alongside this one, each full of
+        // dojoType declarations and their own <script type="dojo/method">
+        // blocks), and a bare <script> tag dropped in here confused dojo's
+        // parser badly enough to abort ALL script evaluation for the entire
+        // fragment silently - not just this one, every plugin's, since it's
+        // one parse pass over the combined HTML. A data attribute is inert
+        // to dojo's parser and sidesteps that entirely. All interaction
+        // (input/focus/click) is wired up via delegated listeners bound
+        // once in get_prefs_js() instead of a per-render init call.
+        print "<tr><td colspan='2'>" .
+            "<input type='text' id='af-advisor-browser-fetch-search' placeholder=\"" .
+            htmlspecialchars(__('Search your feeds by title or URL...'), ENT_QUOTES) .
+            "\" autocomplete='off' style='width:100%;box-sizing:border-box' data-feed-options=\"" .
+            htmlspecialchars(json_encode($all_user_feeds), ENT_QUOTES) . "\">" .
+            "<div id='af-advisor-browser-fetch-results' style='display:none;border:1px solid #ccc;max-height:160px;overflow-y:auto;margin-top:2px;border-radius:2px'></div>" .
+            "<ul id='af-advisor-browser-fetch-list' style='list-style:none;padding:0;margin:8px 0 0 0'>";
+        foreach ($configured_feeds as $f) {
+            print "<li data-url=\"" . htmlspecialchars($f['feed_url'], ENT_QUOTES) . "\" style='padding:3px 0;border-bottom:1px solid #eee'>" .
+                htmlspecialchars($f['title']) . " <small style='opacity:0.6'>" . htmlspecialchars($f['feed_url']) . "</small>" .
+                " <a href='#' class='af-advisor-remove-feed' style='float:right;color:#c00'>" . __('remove') . "</a></li>";
+        }
+        print "</ul></td></tr>";
+
+        print "<style>#af-advisor-check-health .dijitButtonNode { background: #1a73e8 !important; border-color: #1165c4 !important; } #af-advisor-check-health .dijitButtonText { color: #fff !important; }</style>";
+        print "<tr><td colspan='2'><p id='af-advisor-check-health'><button dojoType='dijit.form.Button' onclick='return Plugins.Af_Feed_Advisor.checkHealthNow()'>" .
+            __("Check Feed Health Now") . "</button></p></td></tr>";
 
         print "<tr><td colspan='2'><h3 style='margin-bottom:4px'>System Log Monitoring</h3></td></tr>";
         print "<tr><td colspan='2'><p style='margin:4px 0'>" .
@@ -2198,6 +2318,111 @@ class Af_Feed_Advisor extends Plugin
             return false;
         };
 
+        // 'Browser-Rendered Feeds' search-and-add list. The feed catalog
+        // lives in the search box's data-feed-options attribute (not an
+        // inline <script> - see hook_prefs_tab()'s comment on why: the whole
+        // fragment is a dojo-parsed AJAX chunk shared with several other
+        // plugins' own HOOK_PREFS_TAB output, and a bare <script> tag there
+        // silently aborted script evaluation for the entire fragment).
+        // Everything below is wired up via delegated listeners bound once,
+        // here, rather than a per-render init call - works no matter how
+        // many times the containing tab gets reloaded via AJAX.
+        Plugins.Af_Feed_Advisor.renderBrowserFetchSearchResults = function(searchEl) {
+            var box = document.getElementById('af-advisor-browser-fetch-results');
+            var list = document.getElementById('af-advisor-browser-fetch-list');
+            if (!box || !list || !searchEl) return;
+            var query = searchEl.value.trim().toLowerCase();
+            var options = [];
+            try { options = JSON.parse(searchEl.dataset.feedOptions || '[]'); } catch (e) { options = []; }
+            // Empty query shows every not-yet-added feed (dropdown behavior),
+            // not just an empty box - narrows down as the user types.
+            var existingUrls = Array.from(list.querySelectorAll('li')).map(function(li) { return li.dataset.url; });
+            var matches = options.filter(function(f) {
+                return existingUrls.indexOf(f.feed_url) === -1 &&
+                    (!query || f.title.toLowerCase().indexOf(query) !== -1 || f.feed_url.toLowerCase().indexOf(query) !== -1);
+            }).slice(0, 20);
+            box.innerHTML = '';
+            if (!matches.length) {
+                var empty = document.createElement('div');
+                empty.textContent = query ? 'No matching feeds' : 'No feeds available';
+                empty.style.cssText = 'padding:4px 6px;color:#888';
+                box.appendChild(empty);
+                box.style.display = 'block';
+                return;
+            }
+            matches.forEach(function(f) {
+                var row = document.createElement('div');
+                row.textContent = f.title + ' (' + f.feed_url + ')';
+                row.className = 'af-advisor-browser-fetch-result';
+                row.dataset.url = f.feed_url;
+                row.dataset.title = f.title;
+                row.style.cssText = 'padding:4px 6px;cursor:pointer';
+                row.onmouseenter = function() { row.style.background = '#eef'; };
+                row.onmouseleave = function() { row.style.background = ''; };
+                box.appendChild(row);
+            });
+            box.style.display = 'block';
+        };
+
+        Plugins.Af_Feed_Advisor.addBrowserFetchFeed = function(title, url) {
+            var list = document.getElementById('af-advisor-browser-fetch-list');
+            var search = document.getElementById('af-advisor-browser-fetch-search');
+            var box = document.getElementById('af-advisor-browser-fetch-results');
+            if (!list) return;
+            var li = document.createElement('li');
+            li.dataset.url = url;
+            li.style.cssText = 'padding:3px 0;border-bottom:1px solid #eee';
+            var label = document.createElement('span');
+            label.textContent = title + ' ';
+            var small = document.createElement('small');
+            small.style.opacity = '0.6';
+            small.textContent = url;
+            var remove = document.createElement('a');
+            remove.href = '#';
+            remove.className = 'af-advisor-remove-feed';
+            remove.style.cssText = 'float:right;color:#c00';
+            remove.textContent = 'remove';
+            li.appendChild(label);
+            li.appendChild(small);
+            li.appendChild(remove);
+            list.appendChild(li);
+            if (search) search.value = '';
+            if (box) { box.style.display = 'none'; box.innerHTML = ''; }
+        };
+
+        // Delegated on document since the search box/list/results are
+        // (re)created every time this AJAX tab loads - no per-render init
+        // needed, and 'focus' doesn't bubble so it's bound on the capture
+        // phase instead.
+        document.addEventListener('input', function(e) {
+            if (e.target && e.target.id === 'af-advisor-browser-fetch-search') {
+                Plugins.Af_Feed_Advisor.renderBrowserFetchSearchResults(e.target);
+            }
+        });
+
+        document.addEventListener('focus', function(e) {
+            if (e.target && e.target.id === 'af-advisor-browser-fetch-search') {
+                Plugins.Af_Feed_Advisor.renderBrowserFetchSearchResults(e.target);
+            }
+        }, true);
+
+        document.addEventListener('click', function(e) {
+            if (e.target.classList && e.target.classList.contains('af-advisor-remove-feed')) {
+                e.preventDefault();
+                e.target.closest('li').remove();
+                return;
+            }
+            if (e.target.classList && e.target.classList.contains('af-advisor-browser-fetch-result')) {
+                Plugins.Af_Feed_Advisor.addBrowserFetchFeed(e.target.dataset.title, e.target.dataset.url);
+                return;
+            }
+            var search = document.getElementById('af-advisor-browser-fetch-search');
+            var box = document.getElementById('af-advisor-browser-fetch-results');
+            if (box && search && e.target !== search && !box.contains(e.target)) {
+                box.style.display = 'none';
+            }
+        });
+
         Plugins.Af_Feed_Advisor.createNotificationArticle = function() {
             var title = document.getElementById('af-advisor-notif-title').value;
             var content = document.getElementById('af-advisor-notif-content').value;
@@ -2303,6 +2528,24 @@ class Af_Feed_Advisor extends Plugin
             preg_split('/\r\n|\r|\n/', $log_filter_patterns_raw)
         ), fn($line) => $line !== ''));
 
+        // The form submits feed URLs (see hook_prefs_tab()'s search-and-add
+        // list), not raw IDs - resolve them back to IDs here, scoped to the
+        // logged-in user, so the stored setting (and hook_fetch_feed()'s
+        // matching logic) stays exactly what it was before that UI existed.
+        $browser_fetch_feed_urls_raw = (string)($_POST['browser_fetch_feed_urls'] ?? '');
+        $browser_fetch_feed_urls = array_values(array_filter(array_map(
+            'trim',
+            preg_split('/\r\n|\r|\n/', $browser_fetch_feed_urls_raw)
+        ), fn($url) => $url !== ''));
+
+        $browser_fetch_feed_ids = array();
+        if ($browser_fetch_feed_urls) {
+            $placeholders = implode(',', array_fill(0, count($browser_fetch_feed_urls), '?'));
+            $sth = Db::pdo()->prepare("SELECT id FROM ttrss_feeds WHERE owner_uid = ? AND feed_url IN ({$placeholders})");
+            $sth->execute(array_merge([(int)($_SESSION['uid'] ?? 0)], $browser_fetch_feed_urls));
+            $browser_fetch_feed_ids = array_map('intval', $sth->fetchAll(PDO::FETCH_COLUMN));
+        }
+
         $this->host->set($this, 'enabled', $enabled);
         $this->host->set($this, 'auto_apply', $auto_apply);
         $this->host->set($this, 'enclosure_check', $enclosure_check);
@@ -2314,6 +2557,7 @@ class Af_Feed_Advisor extends Plugin
         $this->host->set($this, 'report_interval_hours', $report_interval_hours);
         $this->host->set($this, 'system_check_interval_hours', $system_check_interval_hours);
         $this->host->set($this, 'log_filter_patterns', json_encode($log_filter_patterns));
+        $this->host->set($this, 'browser_fetch_feed_ids', json_encode($browser_fetch_feed_ids));
 
         echo __("Configuration saved.");
     }
