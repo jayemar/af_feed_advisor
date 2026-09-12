@@ -82,6 +82,14 @@ class Af_Feed_Advisor extends Plugin
         return "/#/feed/{$feed_id}?editFeed={$feed_id}";
     }
 
+    // Same relative-link reasoning as rhesus_edit_feed_url() above, but for
+    // the general Feed Management panel rather than one specific feed's
+    // dialog. ?manageFeeds=1 is read by AppShell.vue to open that panel,
+    // same as clicking the sidebar's "Manage feeds" button.
+    private function rhesus_manage_feeds_url() {
+        return "/#/?manageFeeds=1";
+    }
+
     function about()
     {
         return array(
@@ -1098,9 +1106,16 @@ class Af_Feed_Advisor extends Plugin
             "<path d=\"M15 3h6v6\"/><path d=\"M10 14 21 3\"/>" .
             "<path d=\"M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6\"/></svg></a>";
 
+        // Same-origin hash link into Rhesus, not TT-RSS's own classic UI -
+        // same rationale as the per-feed links below (no target="_blank":
+        // Rhesus's hash-based router just re-routes whatever tab the report
+        // is already open in).
+        $rhesus_manage_feeds_link = "<a href=\"" . htmlspecialchars($this->rhesus_manage_feeds_url()) . "\">Manage feeds</a>";
+
         $content = "<div class='feed-advisor-article'>";
         $content .= "<h2>Feed Health Report{$ttrss_settings_icon}</h2>";
         $content .= "<p><strong>Generated:</strong> {$timestamp}</p>";
+        $content .= "<p>{$rhesus_manage_feeds_link}</p>";
 
         // Broken feeds section
         $content .= "<h3>Broken Feeds</h3>";
