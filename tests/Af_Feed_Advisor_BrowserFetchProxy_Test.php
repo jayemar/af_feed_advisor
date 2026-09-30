@@ -152,4 +152,48 @@ class Af_Feed_Advisor_BrowserFetchProxy_Test extends TestCase
             $this->assertSame(1, $this->lastSavePdoCallDelta, 'a submitted URL should trigger exactly one DB lookup');
         }
     }
+
+    // =========================================================================
+    // browser_rendered_cell() - the Broken Feeds table's "Browser-Rendered"
+    // column: a same-tab-opening link to TT-RSS settings, labeled Yes/No
+    // depending on whether the feed is already in the browser-fetch list.
+    // =========================================================================
+
+    private function callBrowserRenderedCell(int $feed_id, array $browser_fetch_feed_ids): string
+    {
+        $host = $this->createMock(\PluginHost::class);
+        $host->method('add_hook')->willReturn(true);
+        $plugin = new Af_Feed_Advisor();
+        $plugin->init($host);
+
+        $ref = new \ReflectionClass($plugin);
+        $m = $ref->getMethod('browser_rendered_cell');
+        $m->setAccessible(true);
+        return $m->invoke($plugin, $feed_id, $browser_fetch_feed_ids);
+    }
+
+    public function test_browser_rendered_cell_says_yes_when_feed_is_in_list()
+    {
+        $html = $this->callBrowserRenderedCell(200, [197, 200]);
+
+        $this->assertStringContainsString('>Yes<', $html);
+    }
+
+    public function test_browser_rendered_cell_says_no_when_feed_is_not_in_list()
+    {
+        $html = $this->callBrowserRenderedCell(200, [197]);
+
+        $this->assertStringContainsString('>No<', $html);
+    }
+
+    public function test_browser_rendered_cell_links_to_ttrss_settings_in_new_tab_either_way()
+    {
+        foreach ([true, false] as $in_list) {
+            $html = $this->callBrowserRenderedCell(200, $in_list ? [200] : []);
+
+            $this->assertStringContainsString('href="/tt-rss/prefs.php"', $html);
+            $this->assertStringContainsString('target="_blank"', $html);
+            $this->assertStringContainsString('rel="noopener"', $html);
+        }
+    }
 }
