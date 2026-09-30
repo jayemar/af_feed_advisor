@@ -182,9 +182,12 @@ class Af_Feed_Advisor extends Plugin
                 $this->check_system_logs();
             }
             if ($this->should_check_health()) {
+                // Computed once for the whole cycle, not per user - see
+                // check_browser_rendered_feeds()'s doc comment for why.
+                $browser_rendered_results = $this->check_browser_rendered_feeds();
                 $sth = Db::pdo()->query("SELECT id FROM ttrss_users WHERE id > 0");
                 foreach ($sth->fetchAll(PDO::FETCH_COLUMN) as $uid) {
-                    $this->check_feed_health((int)$uid);
+                    $this->check_feed_health((int)$uid, false, $browser_rendered_results);
                 }
             }
         }
@@ -942,7 +945,7 @@ class Af_Feed_Advisor extends Plugin
         return (int)($state['last_log_check'] ?? 0);
     }
 
-    private function check_feed_health(int $owner_uid, bool $force = false): int
+    private function check_feed_health(int $owner_uid, bool $force = false, ?array $browser_rendered_results = null): int
     {
         $pdo = Db::pdo();
         $broken_days = $this->get_broken_days();
@@ -978,12 +981,21 @@ class Af_Feed_Advisor extends Plugin
         $sth->execute([$owner_uid]);
         $stale_feeds = $sth->fetchAll(PDO::FETCH_ASSOC);
 
-        $this->create_consolidated_health_advisory($broken_feeds, $stale_feeds, $owner_uid, $force);
+        // Callers looping over every user in one health-check cycle (see
+        // hook_house_keeping()) pass this in precomputed so the same probe
+        // isn't repeated per user; checkHealthNow()'s single on-demand call
+        // just leaves it null and gets a fresh one here.
+        if ($browser_rendered_results === null) {
+            $browser_rendered_results = $this->check_browser_rendered_feeds();
+        }
+
+        $this->create_consolidated_health_advisory($broken_feeds, $stale_feeds, $owner_uid, $force, $browser_rendered_results);
 
         $broken_count = count($broken_feeds);
         $stale_count = count($stale_feeds);
-        Debug::log("Feed Advisor: Health check complete for uid={$owner_uid}, {$broken_count} broken, {$stale_count} stale.");
-        return $broken_count + $stale_count;
+        $no_longer_needed_count = count(array_filter($browser_rendered_results, fn($r) => !$r['still_needed']));
+        Debug::log("Feed Advisor: Health check complete for uid={$owner_uid}, {$broken_count} broken, {$stale_count} stale, {$no_longer_needed_count} outdated browser-rendered.");
+        return $broken_count + $stale_count + $no_longer_needed_count;
     }
 
     // Returns the id of this user's "Feed Advisor" synthetic feed, creating
@@ -1067,12 +1079,13 @@ class Af_Feed_Advisor extends Plugin
         print "</table>";
     }
 
-    private function create_consolidated_health_advisory(array $broken_feeds, array $stale_feeds, int $owner_uid, bool $force = false): void
+    private function create_consolidated_health_advisory(array $broken_feeds, array $stale_feeds, int $owner_uid, bool $force = false, array $browser_rendered_results = []): void
     {
         $broken_count = count($broken_feeds);
         $stale_count = count($stale_feeds);
+        $no_longer_needed_count = count(array_filter($browser_rendered_results, fn($r) => !$r['still_needed']));
 
-        if (!$force && $broken_count === 0 && $stale_count === 0 && $this->is_quiet_when_clean_enabled()) {
+        if (!$force && $broken_count === 0 && $stale_count === 0 && $no_longer_needed_count === 0 && $this->is_quiet_when_clean_enabled()) {
             Debug::log("Feed Advisor: No feed issues for uid={$owner_uid}, skipping report (quiet mode).");
             return;
         }
@@ -1089,6 +1102,9 @@ class Af_Feed_Advisor extends Plugin
         }
         if ($stale_count > 0) {
             $parts[] = "{$stale_count} stale";
+        }
+        if ($no_longer_needed_count > 0) {
+            $parts[] = "{$no_longer_needed_count} outdated browser-rendered";
         }
         $title = "Feed Health Report" . (!empty($parts) ? ': ' . implode(', ', $parts) : ': all clear');
 
@@ -1125,7 +1141,9 @@ class Af_Feed_Advisor extends Plugin
             $content .= "<p>{$broken_count} feed" . ($broken_count !== 1 ? 's have' : ' has') .
                         " been failing for more than {$broken_days} days.</p>";
             $content .= "<table>";
-            $content .= "<tr><th>Feed</th><th>Error Type</th><th>Last Success</th><th>Suggestion</th></tr>";
+            $content .= "<tr><th>Feed</th><th>Error Type</th><th>Last Success</th><th>Browser-Rendered</th><th>Suggestion</th></tr>";
+
+            $browser_fetch_feed_ids = $this->get_browser_fetch_feed_ids();
 
             foreach ($broken_feeds as $feed) {
                 $error_info = $this->categorize_feed_error($feed['last_error']);
@@ -1148,10 +1166,14 @@ class Af_Feed_Advisor extends Plugin
                 // navigation, not a fresh page load.
                 $feed_link = "<a href=\"" . htmlspecialchars($this->rhesus_edit_feed_url($feed['id'])) . "\">" .
                              htmlspecialchars($feed['title']) . "</a>";
+
+                $browser_rendered_cell = $this->browser_rendered_cell((int)$feed['id'], $browser_fetch_feed_ids);
+
                 $content .= "<tr>";
                 $content .= "<td>{$feed_link}</td>";
                 $content .= "<td>{$error_info['label']}</td>";
                 $content .= "<td>{$last_success_str}</td>";
+                $content .= "<td>{$browser_rendered_cell}</td>";
                 $content .= "<td>{$error_info['suggestion']}</td>";
                 $content .= "</tr>";
             }
@@ -1193,6 +1215,8 @@ class Af_Feed_Advisor extends Plugin
             $content .= "</table>";
         }
 
+        $content .= $this->render_browser_rendered_section($browser_rendered_results);
+
         $content .= "<hr>";
         $content .= "<p><small>Checked: {$timestamp}</small></p>";
         $content .= "</div>";
@@ -1226,14 +1250,14 @@ class Af_Feed_Advisor extends Plugin
             ");
             $sth->execute([$entry_id, $feed_id, $owner_uid]);
 
-            if ($broken_count > 0 || $stale_count > 0) {
+            if ($broken_count > 0 || $stale_count > 0 || $no_longer_needed_count > 0) {
                 $label_id = $this->get_or_create_health_label($owner_uid);
                 if ($label_id) {
                     $this->apply_label_to_entry($entry_id, $label_id);
                 }
             }
 
-            Debug::log("Feed Advisor: Created health report ({$broken_count} broken, {$stale_count} stale).");
+            Debug::log("Feed Advisor: Created health report ({$broken_count} broken, {$stale_count} stale, {$no_longer_needed_count} outdated browser-rendered).");
         } catch (Exception $e) {
             Debug::log("Feed Advisor: Failed to create consolidated health report: " . $e->getMessage());
         }
@@ -1438,6 +1462,139 @@ class Af_Feed_Advisor extends Plugin
         }
         $decoded = json_decode($raw, true);
         return is_array($decoded) ? array_map('intval', $decoded) : array();
+    }
+
+    /**
+     * "Browser-Rendered" column for the Broken Feeds table in the health
+     * report: indicates whether a feed is already in the
+     * "browser_fetch_feed_ids" list, linking to TT-RSS's settings either
+     * way. No URL fragment deep-links into a specific AccordionPane/tab in
+     * TT-RSS's Dojo prefs UI, so this is the same plain (no sid) new-tab
+     * link as the report header's settings icon - it just gets the reader
+     * to Preferences, where they open Feeds -> Feed Advisor ->
+     * Browser-Rendered Feeds themselves.
+     */
+    private function browser_rendered_cell(int $feed_id, array $browser_fetch_feed_ids): string
+    {
+        $is_browser_rendered = in_array($feed_id, $browser_fetch_feed_ids, true);
+        return "<a href=\"/tt-rss/prefs.php\" target=\"_blank\" rel=\"noopener\" " .
+            "title=\"Open TT-RSS settings (Feeds &gt; Feed Advisor &gt; Browser-Rendered Feeds)\">" .
+            ($is_browser_rendered ? "Yes" : "No") . "</a>";
+    }
+
+    /**
+     * Re-checks every feed currently in "Browser-Rendered Feeds" (see
+     * get_browser_fetch_feed_ids()/hook_fetch_feed()) with a direct,
+     * non-proxied UrlHelper::fetch() - the same call TT-RSS's own core
+     * update would make - to see whether the anti-bot block that
+     * originally required routing it through browser-fetch-proxy is still
+     * in effect. A feed successfully served through the proxy carries no
+     * last_error at all (hook_fetch_feed() returns the proxy's result
+     * directly, so TT-RSS's own fetch never runs for it), so it never
+     * surfaces in the Broken Feeds table above - this is the only way to
+     * notice one has quietly stopped needing the workaround.
+     *
+     * UrlHelper::fetch() itself already returns false for any 4xx/5xx
+     * response (Guzzle's BadResponseException, caught internally) as well
+     * as connection failures - a non-empty return here is a genuine 2xx
+     * response with a real body, the same bar hook_fetch_feed() itself
+     * uses for the proxy's result. No feed-format validation beyond that;
+     * a site returning some other kind of 200 page (a login wall, say)
+     * would misreport as "no longer needed", but that's a rare enough
+     * edge case not to be worth a full feed-parse just for this check.
+     *
+     * Intended to run at most once per health-check cycle (see
+     * hook_house_keeping()), not once per user - the configured list is
+     * effectively global already (get_plugin_setting()'s own daemon-context
+     * fallback), so re-probing it per user would just repeat the same
+     * network requests for no benefit.
+     */
+    private function check_browser_rendered_feeds(): array
+    {
+        $ids = $this->get_browser_fetch_feed_ids();
+        if (empty($ids)) {
+            return array();
+        }
+
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $sth = Db::pdo()->prepare("SELECT id, title, feed_url FROM ttrss_feeds WHERE id IN ({$placeholders})");
+        $sth->execute($ids);
+        $feeds = $sth->fetchAll(PDO::FETCH_ASSOC);
+
+        $results = array();
+        foreach ($feeds as $feed) {
+            $results[] = array(
+                'id' => (int)$feed['id'],
+                'title' => $feed['title'],
+                'still_needed' => $this->is_still_needed_via_direct_fetch($feed['feed_url']),
+            );
+        }
+
+        return $results;
+    }
+
+    /**
+     * The actual re-check for one feed, split out from
+     * check_browser_rendered_feeds() so it's testable against the
+     * UrlHelper::fetch() mock without needing a real database. See that
+     * method's doc comment for what "still needed" means and why an
+     * exception (as well as an empty/false return) counts as still needed
+     * - a failed re-check should never read as "safe to remove".
+     */
+    private function is_still_needed_via_direct_fetch(string $feed_url): bool
+    {
+        try {
+            $body = UrlHelper::fetch(array(
+                'url' => $feed_url,
+                'timeout' => 15,
+            ));
+            return empty($body);
+        } catch (Exception $e) {
+            Debug::log("Feed Advisor: browser-rendered re-check failed for {$feed_url}: " . $e->getMessage());
+            return true;
+        }
+    }
+
+    /**
+     * Renders the "Browser-Rendered Feeds" section of the health report -
+     * see check_browser_rendered_feeds() for what it's checking and why.
+     * Omitted entirely (not even an empty-state message) when nothing is
+     * configured, unlike Broken/Stale Feeds below - those sections always
+     * apply to every installation, but this one only means anything once
+     * you've actually added a feed to the list.
+     */
+    private function render_browser_rendered_section(array $results): string
+    {
+        if (empty($results)) {
+            return '';
+        }
+
+        $no_longer_needed = array_values(array_filter($results, fn($r) => !$r['still_needed']));
+
+        $content = "<h3>Browser-Rendered Feeds</h3>";
+        if (empty($no_longer_needed)) {
+            $content .= "<p>All " . count($results) . " configured feed" . (count($results) !== 1 ? 's' : '') .
+                        " still need browser rendering.</p>";
+        } else {
+            $content .= "<p>" . count($no_longer_needed) . " of " . count($results) .
+                        " configured feed" . (count($results) !== 1 ? 's' : '') .
+                        " fetched successfully without the browser-fetch-proxy sidecar - consider removing " .
+                        (count($no_longer_needed) !== 1 ? 'them' : 'it') . " from the list.</p>";
+        }
+
+        $content .= "<table>";
+        $content .= "<tr><th>Feed</th><th>Status</th></tr>";
+        foreach ($results as $r) {
+            $feed_link = "<a href=\"" . htmlspecialchars($this->rhesus_edit_feed_url($r['id'])) . "\">" .
+                         htmlspecialchars($r['title']) . "</a>";
+            $status = $r['still_needed']
+                ? "Still needed"
+                : "<strong>May no longer be needed</strong>";
+            $content .= "<tr><td>{$feed_link}</td><td>{$status}</td></tr>";
+        }
+        $content .= "</table>";
+
+        return $content;
     }
 
     /**
@@ -1971,24 +2128,11 @@ class Af_Feed_Advisor extends Plugin
         $quiet_when_clean = $this->is_quiet_when_clean_enabled();
         $system_quiet_when_clean = $this->is_system_quiet_when_clean_enabled();
 
-        print "<form dojoType='dijit.form.Form'>";
+        print "<form id='af-advisor-form' dojoType='dijit.form.Form'>";
 
         print "<script type='dojo/method' event='onSubmit' args='evt'>
             evt.preventDefault();
-            if (this.validate()) {
-                Notify.progress('Saving data...', true);
-                const values = this.getValues();
-                const filterEl = document.getElementById('af-advisor-log-filter-patterns');
-                if (filterEl) values.log_filter_patterns = filterEl.value;
-                const browserFetchList = document.getElementById('af-advisor-browser-fetch-list');
-                if (browserFetchList) {
-                    values.browser_fetch_feed_urls = Array.from(browserFetchList.querySelectorAll('li'))
-                        .map(li => li.dataset.url).join('\\n');
-                }
-                xhr.post('backend.php', values, (reply) => {
-                    Notify.info(reply);
-                });
-            }
+            Plugins.Af_Feed_Advisor.saveSettingsForm();
         </script>";
 
         print "<input dojoType='dijit.form.TextBox' style='display:none' name='op' value='PluginHandler'>";
@@ -2125,15 +2269,26 @@ class Af_Feed_Advisor extends Plugin
             "<div id='af-advisor-browser-fetch-results' style='display:none;border:1px solid #ccc;max-height:160px;overflow-y:auto;margin-top:2px;border-radius:2px'></div>" .
             "<ul id='af-advisor-browser-fetch-list' style='list-style:none;padding:0;margin:8px 0 0 0'>";
         foreach ($configured_feeds as $f) {
-            print "<li data-url=\"" . htmlspecialchars($f['feed_url'], ENT_QUOTES) . "\" style='padding:3px 0;border-bottom:1px solid #eee'>" .
+            print "<li data-url=\"" . htmlspecialchars($f['feed_url'], ENT_QUOTES) . "\" data-title=\"" . htmlspecialchars($f['title'], ENT_QUOTES) . "\" style='padding:3px 0;border-bottom:1px solid #eee'>" .
                 htmlspecialchars($f['title']) . " <small style='opacity:0.6'>" . htmlspecialchars($f['feed_url']) . "</small>" .
                 " <a href='#' class='af-advisor-remove-feed' style='float:right;color:#c00'>" . __('remove') . "</a></li>";
         }
         print "</ul></td></tr>";
 
-        print "<style>#af-advisor-check-health .dijitButtonNode { background: #1a73e8 !important; border-color: #1165c4 !important; } #af-advisor-check-health .dijitButtonText { color: #fff !important; }</style>";
-        print "<tr><td colspan='2'><p id='af-advisor-check-health'><button dojoType='dijit.form.Button' onclick='return Plugins.Af_Feed_Advisor.checkHealthNow()'>" .
-            __("Check Feed Health Now") . "</button></p></td></tr>";
+        print "<style>#af-advisor-save-top .dijitButtonNode, #af-advisor-check-health .dijitButtonNode { background: #1a73e8 !important; border-color: #1165c4 !important; } #af-advisor-save-top .dijitButtonText, #af-advisor-check-health .dijitButtonText { color: #fff !important; }</style>";
+        // A second submit button, next to "Check Feed Health Now" - the
+        // form's only other Save button is all the way at the bottom, past
+        // System Log Monitoring and Feed Enclosure Settings, so saving the
+        // Browser-Rendered Feeds list just above (or anything else earlier
+        // in the form) means scrolling past all of that. Both are
+        // type='submit' on the same dojo form, so either one triggers the
+        // same onSubmit handler above - no separate wiring needed.
+        print "<tr><td colspan='2'><div style='display:flex;gap:8px;align-items:center'>" .
+            "<p id='af-advisor-save-top' style='margin:0'><button dojoType='dijit.form.Button' type='submit'>" .
+            __("Save") . "</button></p>" .
+            "<p id='af-advisor-check-health' style='margin:0'><button dojoType='dijit.form.Button' onclick='return Plugins.Af_Feed_Advisor.checkHealthNow()'>" .
+            __("Check Feed Health Now") . "</button></p>" .
+            "</div></td></tr>";
 
         print "<tr><td colspan='2'><h3 style='margin-bottom:4px'>System Log Monitoring</h3></td></tr>";
         print "<tr><td colspan='2'><p style='margin:4px 0'>" .
@@ -2319,6 +2474,31 @@ class Af_Feed_Advisor extends Plugin
             return false;
         };
 
+        // Shared by the form's own Save button (onSubmit, above) and by
+        // addBrowserFetchFeed()/the remove handler below, which each call
+        // this directly after a confirmed add/remove so that change is
+        // persisted immediately rather than sitting unsaved until the user
+        // happens to click Save - the same full-form save either way (this
+        // tab has no narrower save-just-the-browser-fetch-list endpoint,
+        // and every other field here already only ever saves as part of
+        // the whole form).
+        Plugins.Af_Feed_Advisor.saveSettingsForm = function() {
+            var formWidget = dijit.byId('af-advisor-form');
+            if (!formWidget || !formWidget.validate()) return;
+            Notify.progress('Saving data...', true);
+            var values = formWidget.getValues();
+            var filterEl = document.getElementById('af-advisor-log-filter-patterns');
+            if (filterEl) values.log_filter_patterns = filterEl.value;
+            var browserFetchList = document.getElementById('af-advisor-browser-fetch-list');
+            if (browserFetchList) {
+                values.browser_fetch_feed_urls = Array.from(browserFetchList.querySelectorAll('li'))
+                    .map(function(li) { return li.dataset.url; }).join('\\n');
+            }
+            xhr.post('backend.php', values, function(reply) {
+                Notify.info(reply);
+            });
+        };
+
         Plugins.Af_Feed_Advisor.checkHealthNow = function() {
             Notify.progress('Checking feed health...', true);
             xhr.json('backend.php', {op: 'PluginHandler', plugin: 'af_feed_advisor', method: 'checkHealthNow'})
@@ -2380,12 +2560,14 @@ class Af_Feed_Advisor extends Plugin
         };
 
         Plugins.Af_Feed_Advisor.addBrowserFetchFeed = function(title, url) {
+            if (!confirm('Route ' + title + ' through the browser-fetch-proxy sidecar? Only do this for feeds TT-RSS\'s own fetch can\'t reach - it\'s much slower than a normal fetch.')) return;
             var list = document.getElementById('af-advisor-browser-fetch-list');
             var search = document.getElementById('af-advisor-browser-fetch-search');
             var box = document.getElementById('af-advisor-browser-fetch-results');
             if (!list) return;
             var li = document.createElement('li');
             li.dataset.url = url;
+            li.dataset.title = title;
             li.style.cssText = 'padding:3px 0;border-bottom:1px solid #eee';
             var label = document.createElement('span');
             label.textContent = title + ' ';
@@ -2403,6 +2585,7 @@ class Af_Feed_Advisor extends Plugin
             list.appendChild(li);
             if (search) search.value = '';
             if (box) { box.style.display = 'none'; box.innerHTML = ''; }
+            Plugins.Af_Feed_Advisor.saveSettingsForm();
         };
 
         // Delegated on document since the search box/list/results are
@@ -2424,7 +2607,11 @@ class Af_Feed_Advisor extends Plugin
         document.addEventListener('click', function(e) {
             if (e.target.classList && e.target.classList.contains('af-advisor-remove-feed')) {
                 e.preventDefault();
-                e.target.closest('li').remove();
+                var li = e.target.closest('li');
+                var title = li ? (li.dataset.title || li.dataset.url) : '';
+                if (!confirm('Remove ' + title + ' from Browser-Rendered Feeds?')) return;
+                li.remove();
+                Plugins.Af_Feed_Advisor.saveSettingsForm();
                 return;
             }
             if (e.target.classList && e.target.classList.contains('af-advisor-browser-fetch-result')) {

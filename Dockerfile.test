@@ -1,0 +1,29 @@
+# Dockerfile for running af_feed_advisor tests
+# Usage: docker build -f Dockerfile.test -t af_feed_advisor:test .
+#        docker run --rm af_feed_advisor:test
+
+FROM php:8.2-cli-alpine
+
+# Install required PHP extensions
+RUN apk add --no-cache \
+    $PHPIZE_DEPS \
+    libxml2-dev \
+    && docker-php-ext-install \
+    dom \
+    xml \
+    && apk del $PHPIZE_DEPS
+
+# Install Composer
+COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
+
+# Set working directory
+WORKDIR /app
+
+# Copy plugin files
+COPY . /app
+
+# Install dependencies
+RUN composer install --no-interaction --prefer-dist
+
+# Run tests by default
+CMD ["./vendor/bin/phpunit", "--testdox", "--colors=always"]
